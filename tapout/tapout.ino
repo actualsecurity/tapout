@@ -134,7 +134,7 @@ struct RingEvent;
 // pass (a blocking TLS GET) -- hammering GitHub and starving the ring path. The
 // floor throttles that; the ceiling keeps otaIntervalMin * 60000UL from
 // overflowing the 32-bit multiply.
-static const uint32_t OTA_INTERVAL_MIN_MINUTES = 15;          // >= 15 min between checks
+static const uint32_t OTA_INTERVAL_MIN_MINUTES = 1;           // >= 1 min between checks (fast polling allowed for the testing/trial period; raise via OTA later)
 static const uint32_t OTA_INTERVAL_MAX_MINUTES = 10080;       // <= 1 week (overflow-safe)
 static inline uint32_t clampOtaInterval(uint32_t v) {
   if (v < OTA_INTERVAL_MIN_MINUTES) return OTA_INTERVAL_MIN_MINUTES;
@@ -244,7 +244,7 @@ static const uint8_t  RINGLOG_N         = 20;          // events kept on flash
 static const uint8_t  RINGLOG_VERSION   = 2;           // bump if blob layout changes (v2 adds simMask)
 
 // Web identity / build stamp.
-static const char* FW_VERSION    = "2.0.4";
+static const char* FW_VERSION    = "2.0.6";
 static const char* FW_BUILD_MARK = __DATE__ " " __TIME__;
 
 // --------------------------- State --------------------------------------
@@ -1500,7 +1500,8 @@ static bool otaDownloadAndFlash(const String& url, size_t totalSize /* firmware 
   cfg.end();
   otaState = PULL_OTA_PENDING_REBOOT;
   sendNtfy(C.ntfyStatus.c_str(), "OTA staged",
-           (String("Signed image ") + otaPendingVer + " verified; rebooting into trial.").c_str(),
+           (String("v") + otaPendingVer + " downloaded + signature verified + written to the "
+            "standby slot. Rebooting into a 60s health trial...").c_str(),
            "default", "arrows_counterclockwise");
   Serial.println(F("[ota] staged + verified -- rebooting into trial"));
   delay(500);
@@ -1576,9 +1577,9 @@ static void otaCheckManifest() {
 
   strncpy(otaPendingVer, ver.c_str(), sizeof(otaPendingVer) - 1);
   otaPendingVer[sizeof(otaPendingVer) - 1] = 0;
-  char m[96]; snprintf(m, sizeof(m), "update %s available -> downloading", ver.c_str());
+  char m[110]; snprintf(m, sizeof(m), "v%s found (running v%s) -- downloading the signed image...", ver.c_str(), FW_VERSION);
   otaNote(m);
-  sendNtfy(C.ntfyStatus.c_str(), "OTA downloading", m, "default", "arrow_down");
+  sendNtfy(C.ntfyStatus.c_str(), "OTA update found", m, "default", "arrow_down");
   if (!otaDownloadAndFlash(url, sz)) {     // returns ONLY on failure (success reboots into the new image)
     char f[100]; snprintf(f, sizeof(f), "download/flash of %s FAILED (rejected/timeout/size) -- staying on %s", ver.c_str(), FW_VERSION);
     otaNote(f);
@@ -1633,6 +1634,13 @@ static void handleCheckOta() {
   bool newer = mver.length() && semver(mver) > semver(FW_VERSION);
   bool wouldUpdate = gates && newer && murl.length() && msz;
   if (wouldUpdate) lastOtaCheckMs = 0;    // scheduler fires otaCheckManifest -> download next loop
+
+  // Confirm the MANUAL check on the STATUS thread (user-initiated, so not spammy).
+  { char p[128];
+    if (wouldUpdate)  snprintf(p, sizeof(p), "Manual check: v%s available -> starting update from v%s", mver.c_str(), FW_VERSION);
+    else if (!gates)  snprintf(p, sizeof(p), "Manual check: blocked by a safety gate (see /status.json)");
+    else              snprintf(p, sizeof(p), "Manual check: no new version (running v%s, latest v%s)", FW_VERSION, mver.length() ? mver.c_str() : "?");
+    sendNtfy(C.ntfyStatus.c_str(), "OTA check (manual)", p, "default", "mag"); }
 
   String j = String(F("{\"current\":\"")) + FW_VERSION + "\",\"gates\":{";
   j += String(F("\"enabled\":"))      + (enabled?"true":"false");
@@ -1706,9 +1714,11 @@ static void otaServiceProbation() {
       cfg.remove("ota_failed_ver");                 // this version proved healthy -> clear any stale marker
       cfg.end();
       C.otaFailedVer = "";
-      sendNtfy(C.ntfyStatus.c_str(), "OTA committed",
-               (String("Now running fw ") + FW_VERSION + " -- health probe passed.").c_str(),
-               "low", "white_check_mark");
+      sendNtfy(C.ntfyStatus.c_str(), "Update successful",
+               (String("Successfully updated and trialed firmware v") + FW_VERSION +
+                " -- passed the 60s health trial and committed (no rollback). Now running v"
+                + FW_VERSION + ".").c_str(),
+               "default", "white_check_mark,tada");
       Serial.println(F("[ota] probation PASSED -- image committed"));
       return;
     }
@@ -1722,9 +1732,10 @@ static void otaServiceProbation() {
     cfg.begin("fhacfg", false);
     cfg.putString("ota_failed_ver", FW_VERSION);
     cfg.end();
-    sendNtfy(C.ntfyStatus.c_str(), "OTA ROLLBACK",
-             "New image failed its 60s health probe (WiFi/ntfy unreachable); reverting "
-             "to the previous good image.", "high", "warning");
+    sendNtfy(C.ntfyStatus.c_str(), "OTA rolled back",
+             (String("Firmware v") + FW_VERSION + " FAILED its 60s health trial "
+              "(WiFi/ntfy unreachable) -- auto-reverted to the previous good image.").c_str(),
+             "high", "warning");
     delay(200);
     esp_ota_mark_app_invalid_rollback_and_reboot();   // REVERT to previous good slot (no return)
   }
