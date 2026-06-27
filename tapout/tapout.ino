@@ -244,7 +244,7 @@ static const uint8_t  RINGLOG_N         = 20;          // events kept on flash
 static const uint8_t  RINGLOG_VERSION   = 2;           // bump if blob layout changes (v2 adds simMask)
 
 // Web identity / build stamp.
-static const char* FW_VERSION    = "2.0.6";
+static const char* FW_VERSION    = "2.0.7";
 static const char* FW_BUILD_MARK = __DATE__ " " __TIME__;
 
 // --------------------------- State --------------------------------------
@@ -567,8 +567,7 @@ static void announceOnlineOnce() {
   if (onlineAnnounced) return;
   char msg[224];
   snprintf(msg, sizeof(msg),
-    "Reconnected to WiFi. Boot #%lu, last reset: %s, free heap %u B. "
-    "This is just a test, not a real call.",
+    "Reconnected to WiFi. Boot #%lu, last reset: %s, free heap %u B.",
     (unsigned long)bootCount, gResetReason, (unsigned)ESP.getFreeHeap());
   if (sendNtfy(C.ntfyStatus.c_str(), "Tapout restarted",
                msg, "low", "white_check_mark")) {
@@ -654,10 +653,10 @@ static void fireCallAlert(bool simulated) {
   char msg[224];
   if (ageS < 3) {
     snprintf(msg, sizeof(msg),
-      "Incoming call on the station line at %s. (Bell is primary.)", ts);
+      "Incoming call on the station line at %s.", ts);
   } else {
     snprintf(msg, sizeof(msg),
-      "Phone rang ~%lus ago at %s (alert delayed by network). Bell is primary.",
+      "Phone rang ~%lus ago at %s (alert delayed by network).",
       (unsigned long)ageS, ts);
   }
 
@@ -678,7 +677,7 @@ static void fireCallAlert(bool simulated) {
       // but clearly TEST-labeled so nobody rolls a truck. Never counts as a real
       // delivered call (realCallsDelivered only ticks when !simulated).
       url   = C.ntfyCall.c_str();
-      title = "[TEST] STATION PHONE RINGING -- not a real call";
+      title = "[TEST] STATION PHONE RINGING";
       prio  = "max";
       tags  = "test_tube,rotating_light";
     } else {
@@ -1057,7 +1056,7 @@ static void handleStatusJson() {
 static void handleSendTest() {
   if (!requireAuth()) return;
   bool ok = sendNtfy(C.ntfyStatus.c_str(), "Tapout TEST",
-                     "Manual test alert from the status page. Not a real call.",
+                     "Manual test alert from the status page.",
                      "default", "test_tube");
   esp_task_wdt_reset();
   server.send(ok ? 200 : 502, "text/plain",
@@ -1533,9 +1532,7 @@ static void otaCheckManifest() {
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     char m[72]; snprintf(m, sizeof(m), "poll: manifest fetch failed HTTP %d", code);
-    otaNote(m); http.end();
-    if (millis() - lastNoUpdatePingMs > 21600000UL) { lastNoUpdatePingMs = millis();
-      sendNtfy(C.ntfyStatus.c_str(), "OTA check failed", m, "default", "warning"); }
+    otaNote(m); http.end();   // LAN-visible in /status.json only -- no ntfy ping on routine poll errors
     return;
   }
   String body = http.getString();
@@ -1551,9 +1548,7 @@ static void otaCheckManifest() {
   // Monotonic anti-downgrade gate (ANTI_ROLLBACK fuse is off, so enforce here).
   if (semver(ver) <= semver(FW_VERSION)) {
     char m[88]; snprintf(m, sizeof(m), "polled: no new version (running %s, latest %s)", FW_VERSION, ver.c_str());
-    otaNote(m);
-    if (millis() - lastNoUpdatePingMs > 21600000UL) { lastNoUpdatePingMs = millis();
-      sendNtfy(C.ntfyStatus.c_str(), "OTA check (no update)", m, "min", "white_check_mark"); }
+    otaNote(m);   // LAN-visible in /status.json only -- NO ntfy ping on routine no-update polls
     return;
   }
 
@@ -1636,11 +1631,12 @@ static void handleCheckOta() {
   if (wouldUpdate) lastOtaCheckMs = 0;    // scheduler fires otaCheckManifest -> download next loop
 
   // Confirm the MANUAL check on the STATUS thread (user-initiated, so not spammy).
-  { char p[128];
-    if (wouldUpdate)  snprintf(p, sizeof(p), "Manual check: v%s available -> starting update from v%s", mver.c_str(), FW_VERSION);
-    else if (!gates)  snprintf(p, sizeof(p), "Manual check: blocked by a safety gate (see /status.json)");
-    else              snprintf(p, sizeof(p), "Manual check: no new version (running v%s, latest v%s)", FW_VERSION, mver.length() ? mver.c_str() : "?");
-    sendNtfy(C.ntfyStatus.c_str(), "OTA check (manual)", p, "default", "mag"); }
+  // Ping ONLY when the manual check actually finds a new version (no spam on
+  // no-update / gate-blocked manual checks -- the JSON response already says so).
+  if (wouldUpdate) {
+    char p[128]; snprintf(p, sizeof(p), "Manual check: v%s available -> starting update from v%s", mver.c_str(), FW_VERSION);
+    sendNtfy(C.ntfyStatus.c_str(), "OTA check (manual)", p, "default", "mag");
+  }
 
   String j = String(F("{\"current\":\"")) + FW_VERSION + "\",\"gates\":{";
   j += String(F("\"enabled\":"))      + (enabled?"true":"false");
