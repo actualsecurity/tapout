@@ -244,13 +244,14 @@ static const uint8_t  RINGLOG_N         = 20;          // events kept on flash
 static const uint8_t  RINGLOG_VERSION   = 2;           // bump if blob layout changes (v2 adds simMask)
 
 // Web identity / build stamp.
-static const char* FW_VERSION    = "2.0.8";
+static const char* FW_VERSION    = "2.0.9";
 static const char* FW_BUILD_MARK = __DATE__ " " __TIME__;
 
 // --------------------------- State --------------------------------------
 static uint32_t lastAlertMs      = 0;
 static uint32_t lastRingActiveMs = 0;       // millis() the line was last seen LOW
 static bool     everAlerted      = false;
+static bool     ringArmed        = false;   // false until D4 first reads idle (HIGH); blocks boot-transient / stuck-line / no-line false pages
 static uint32_t lastHeartbeatMs  = 0;
 static uint32_t wifiBackoffMs    = WIFI_BACKOFF_MIN_MS;
 static uint32_t lastWifiAttempt  = 0;
@@ -267,9 +268,17 @@ static uint32_t     realCallsDelivered = 0;
 static esp_reset_reason_t bootReason = ESP_RST_UNKNOWN;
 static const char*  gResetReason = "unknown";
 
-// ----- Boot-time D4 self-test -----
-static bool ringActiveAtBoot = false;
-static bool bootSelftestSent = false;
+// ----- Continuous "stuck line" detector monitor -----
+// D4 LOW means the line is active. A real ring is brief (~2 s on / 4 s off), so
+// D4 held LOW continuously past this threshold is NOT a normal call -- it means
+// the detector is miswired/shorted, the ELK-930 has stuck active, or (harmless)
+// no tip/ring is connected so the open-collector output isn't sitting idle-HIGH.
+// Runs every loop, so it catches a line that drops low at boot OR any time later,
+// and clears itself when the line returns to idle. (Replaces the old boot-only
+// check, which false-fired on the brief LOW transient during startup.)
+static const uint32_t LINE_STUCK_MS  = 20000;   // D4 LOW this long continuously = stuck
+static uint32_t lineLowSinceMs   = 0;           // millis() D4 first went continuously LOW (0 = idle/HIGH)
+static bool     lineStuckWarned  = false;       // warned about the current stuck episode
 
 // ----- Never-lose-a-call queue -----
 static bool     callPending    = false;
@@ -373,7 +382,7 @@ static void serviceWifi();
 static void handleRing();
 static void handleHeartbeat();
 static void announceOnlineOnce();
-static void serviceBootSelftest();
+static void serviceStuckLine();
 static void serviceCredWarn();
 static void serviceHeapCheck();
 static void fireCallAlert(bool simulated);
@@ -578,15 +587,41 @@ static void announceOnlineOnce() {
 // Boot-time D4 self-test: if the detector read LOW at startup it is miswired,
 // shorted, or the line was actually ringing during boot. Retries until the
 // warning is delivered. Non-blocking; safe to call every loop.
-static void serviceBootSelftest() {
-  if (bootSelftestSent) return;
-  if (!ringActiveAtBoot) { bootSelftestSent = true; return; }
+// Continuously watch for the detector line being STUCK active (D4 LOW far longer
+// than any real ring). Warns once per stuck episode and again on recovery, so a
+// miswired/shorted/stuck detector -- or simply tip/ring not yet connected -- is
+// visible without false-firing on normal rings or the brief boot-time transient.
+static void serviceStuckLine() {
+  bool low = (digitalRead(RING_PIN) == LOW);
+  uint32_t now = millis();
+
+  if (!low) {                                  // line idle (HIGH) -> healthy
+    if (lineStuckWarned && WiFi.status() == WL_CONNECTED) {
+      if (sendNtfy(C.ntfyStatus.c_str(), "Detector line recovered",
+                   "D4 returned to idle (HIGH). The ring line is no longer stuck active.",
+                   "default", "white_check_mark")) {
+        lineStuckWarned = false;
+      }
+    } else if (lineStuckWarned) {
+      lineStuckWarned = false;                 // clear even if the ping couldn't go out
+    }
+    lineLowSinceMs = 0;
+    return;
+  }
+
+  if (lineLowSinceMs == 0) lineLowSinceMs = now;        // line just went low
+  if (lineStuckWarned) return;                          // already flagged this episode
+  if ((now - lineLowSinceMs) < LINE_STUCK_MS) return;   // not stuck long enough yet (ignores normal rings + boot transient)
   if (WiFi.status() != WL_CONNECTED) return;
-  if (sendNtfy(C.ntfyStatus.c_str(), "Ring line ACTIVE at boot",
-               "D4 read LOW at startup -- ELK-930 miswired, shorted, or the "
-               "line was ringing during boot. Verify the detector.",
-               "high", "warning")) {
-    bootSelftestSent = true;
+
+  char msg[200];
+  snprintf(msg, sizeof(msg),
+    "D4 has read LOW (line active) continuously for >%lus -- too long to be a real "
+    "call. Likely the ELK-930 is miswired/shorted/stuck, or tip/ring isn't connected "
+    "so the open-collector output isn't sitting idle-HIGH. Verify the detector. (Bell stays primary.)",
+    (unsigned long)(LINE_STUCK_MS / 1000));
+  if (sendNtfy(C.ntfyStatus.c_str(), "Detector line STUCK active", msg, "high", "warning")) {
+    lineStuckWarned = true;
   }
 }
 
@@ -982,7 +1017,8 @@ static void handleStatusJson() {
   // metric for the mbedTLS handshake every CALL/ntfy POST needs. Watch it trend.
   uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   bool frag = (largest < TLS_MIN_CONTIG_BLOCK);
-  bool detectorStuck = (digitalRead(RING_PIN) == LOW);   // line held active
+  // SUSTAINED stuck (not instantaneous) -- a normal brief ring must NOT mark the device unhealthy.
+  bool detectorStuck = (lineLowSinceMs != 0 && (millis() - lineLowSinceMs) >= LINE_STUCK_MS);
   server.sendContent(String(F(",\"largest_free_block\":")) + String((unsigned long)largest));
   server.sendContent(String(F(",\"min_free_heap\":")) + String((unsigned long)esp_get_minimum_free_heap_size()));
   server.sendContent(String(F(",\"tls_ready\":")) + (frag ? "false" : "true"));
@@ -1778,11 +1814,10 @@ void setup() {
 
   // Ring input: idle HIGH, ELK-930 pulls LOW during a ring.
   pinMode(RING_PIN, INPUT_PULLUP);
-  delay(5);
-  ringActiveAtBoot = (digitalRead(RING_PIN) == LOW);  // self-test (sent once WiFi up)
-  if (ringActiveAtBoot) {
-    Serial.println(F("[boot] WARNING: D4 reads LOW at startup (detector check)"));
-  }
+  delay(50);   // let the internal pull-up settle before any read (avoids a transient-LOW false alarm)
+  // No boot-time D4 read here: serviceStuckLine() monitors continuously and only
+  // warns if the line stays active past LINE_STUCK_MS, so a brief startup transient
+  // never false-fires and a genuinely stuck line is caught at boot OR any time after.
 
   // ---- Hardware watchdog -------------------------------------------------
   // arduino-esp32 v3.x uses the struct-based API. The Arduino core may have
@@ -1901,7 +1936,7 @@ void loop() {
   serviceWifi();                // non-blocking reconnect w/ backoff
   serviceCallQueue();           // retry an undelivered CALL alert (never lost)
   handleHeartbeat();            // hourly "still alive" ping
-  serviceBootSelftest();        // one-shot D4-active-at-boot warning
+  serviceStuckLine();           // continuous detector "stuck active" monitor
   serviceCredWarn();            // one-shot default-password warning
   serviceHeapCheck();           // low-heap canary (throttled)
   serviceDeadman();             // external check-in, withheld when degraded (opt-in)
@@ -1971,7 +2006,13 @@ static void serviceWifi() {
 
 // ---------------------- Ring detection ----------------------------------
 static void handleRing() {
-  if (digitalRead(RING_PIN) != LOW) return;   // idle HIGH -> nothing to do
+  if (digitalRead(RING_PIN) != LOW) { ringArmed = true; return; }   // idle HIGH -> arm + nothing to do
+
+  // Do NOT trust a LOW until the line has been seen idle (HIGH) at least once
+  // since boot. This rejects the brief boot-time D4 transient, a stuck line, and
+  // an unconnected detector -- none of them can ever false-page the crew. Once a
+  // genuine idle has been observed, normal ring detection arms.
+  if (!ringArmed) return;
 
   // Debounce: confirm the line is still pulled low.
   delay(DEBOUNCE_MS);
