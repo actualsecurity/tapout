@@ -244,7 +244,7 @@ static const uint8_t  RINGLOG_N         = 20;          // events kept on flash
 static const uint8_t  RINGLOG_VERSION   = 2;           // bump if blob layout changes (v2 adds simMask)
 
 // Web identity / build stamp.
-static const char* FW_VERSION    = "2.0.1";
+static const char* FW_VERSION    = "2.0.3";
 static const char* FW_BUILD_MARK = __DATE__ " " __TIME__;
 
 // --------------------------- State --------------------------------------
@@ -1560,6 +1560,74 @@ static void otaCheckManifest() {
   otaDownloadAndFlash(url, sz);     // returns only on failure (success reboots)
 }
 
+// POST /check-ota (auth). Manual trigger + full diagnosis: reports every OTA gate
+// and a read-only manifest fetch result, and -- if everything is GO and a newer
+// signed version exists -- forces an immediate real check (download) next loop.
+static void handleCheckOta() {
+  if (!requireAuth()) return;
+  esp_task_wdt_reset();
+
+  bool enabled     = C.otaEnabled;
+  bool prov        = isProvisioned();
+  bool manifestSet = !C.otaManifest.isEmpty();
+  bool keyReal     = !looksLikePlaceholder((const char*)PUBLIC_KEY) && PUBLIC_KEY_LEN > 64;
+  bool callP       = callPending;
+  bool ringActive  = (digitalRead(RING_PIN) == LOW);
+  bool justRang    = (millis() - lastRingActiveMs < RING_REARM_IDLE_MS);
+  bool wifi        = (WiFi.status() == WL_CONNECTED);
+  bool heapOk      = (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= TLS_MIN_CONTIG_BLOCK);
+  const esp_partition_t* run = esp_ota_get_running_partition();
+  esp_ota_img_states_t st = (esp_ota_img_states_t)0xFFFFFFFFu;
+  bool stOk    = run && esp_ota_get_state_partition(run, &st) == ESP_OK;
+  bool imgValid = stOk && st == ESP_OTA_IMG_VALID;
+
+  int mhttp = -1; String mver, murl; uint32_t msz = 0;
+  if (wifi && manifestSet) {
+    WiFiClientSecure net; net.setInsecure();
+    net.setHandshakeTimeout(TLS_HANDSHAKE_TIMEOUT_S);
+    HTTPClient http;
+    http.setConnectTimeout(8000); http.setTimeout(8000);
+    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    if (http.begin(net, C.otaManifest)) {
+      esp_task_wdt_reset();
+      mhttp = http.GET();
+      if (mhttp == HTTP_CODE_OK) {
+        String body = http.getString();
+        mver = manifestStr(body, "version");
+        murl = manifestStr(body, "url");
+        msz  = manifestNum(body, "size");
+      }
+      http.end();
+    }
+    esp_task_wdt_reset();
+  }
+
+  bool gates = enabled && prov && manifestSet && keyReal && !callP && !ringActive
+            && !justRang && wifi && heapOk && imgValid;
+  bool newer = mver.length() && semver(mver) > semver(FW_VERSION);
+  bool wouldUpdate = gates && newer && murl.length() && msz;
+  if (wouldUpdate) lastOtaCheckMs = 0;    // scheduler fires otaCheckManifest -> download next loop
+
+  String j = String(F("{\"current\":\"")) + FW_VERSION + "\",\"gates\":{";
+  j += String(F("\"enabled\":"))      + (enabled?"true":"false");
+  j += String(F(",\"provisioned\":")) + (prov?"true":"false");
+  j += String(F(",\"manifest_set\":"))+ (manifestSet?"true":"false");
+  j += String(F(",\"key_real\":"))    + (keyReal?"true":"false");
+  j += String(F(",\"call_pending\":"))+ (callP?"true":"false");
+  j += String(F(",\"ring_active\":")) + (ringActive?"true":"false");
+  j += String(F(",\"just_rang\":"))   + (justRang?"true":"false");
+  j += String(F(",\"wifi\":"))        + (wifi?"true":"false");
+  j += String(F(",\"heap_ok\":"))     + (heapOk?"true":"false");
+  j += String(F(",\"img_state\":"))   + (uint32_t)st;
+  j += String(F(",\"img_valid\":"))   + (imgValid?"true":"false");
+  j += String(F("},\"manifest_http\":")) + mhttp;
+  j += String(F(",\"manifest_version\":\"")) + mver + "\"";
+  j += String(F(",\"manifest_size\":")) + msz;
+  j += String(F(",\"newer\":"))        + (newer?"true":"false");
+  j += String(F(",\"would_update\":")) + (wouldUpdate?"true":"false") + "}";
+  server.send(200, "application/json", j + "\n");
+}
+
 // RAIL B part 1: detect that we just booted a freshly-flashed (PENDING_VERIFY)
 // image. Called very early in setup() so the 60 s trial clock starts at boot.
 static void otaCheckProbationOnBoot() {
@@ -1758,6 +1826,7 @@ void setup() {
     server.send(200, "application/json", "{\"ok\":true}");
     if (server.arg("reboot") == "1") pendingRebootMs = millis() + 600;  // reuse deferred reboot
   });
+  server.on("/check-ota",   HTTP_POST, handleCheckOta);   // manual OTA trigger + gate diagnosis
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.println(F("[web] status server on :80"));
