@@ -246,9 +246,14 @@ jobs:
           mkdir -p ota
           cp "${RUNNER_TEMP}/manifest.json" ota/manifest.json
           git add ota/manifest.json
+          # also bump the README "Firmware: vX.Y.Z" badge so docs track releases
+          if [ -f README.md ]; then
+            sed -i -E "s/\*\*Firmware: v[0-9]+\.[0-9]+\.[0-9]+\*\*/**Firmware: v${{ steps.meta.outputs.version }}**/" README.md
+            git add README.md
+          fi
           if git diff --cached --quiet; then
-            echo "manifest unchanged; nothing to commit"
+            echo "nothing to commit"
           else
-            git commit -m "ci: publish ota/manifest.json for ${{ steps.meta.outputs.tag }}"
+            git commit -m "ci: publish manifest + README version for ${{ steps.meta.outputs.tag }}"
             git push origin "HEAD:${DEFAULT_BRANCH}"
           fi
