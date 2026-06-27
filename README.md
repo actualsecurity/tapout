@@ -135,11 +135,11 @@ form never echoes a stored secret.
 
 Once a unit is on the LAN in normal mode, you can write/patch NVS over the
 network without a USB cable or SoftAP. This is the migration path for the
-already-deployed unit (see [Migration runbook](#migration-runbook-deployed-unit)).
+already-deployed unit.
 
 ```
 curl -u crew:<webpass> -X POST 'http://<device-ip>/provision' \
-  -d 'wifi_ssid=Kite' \
+  -d 'wifi_ssid=<your-2.4GHz-ssid>' \
   -d 'wifi_pass=<wifi-key>' \
   -d 'ntfy_call=https://ntfy.sh/<call-topic>' \
   -d 'ntfy_status=https://ntfy.sh/<status-topic>' \
@@ -388,34 +388,6 @@ once WiFi is up and inbound TCP 80 is permitted.
 - **`POST /reboot`** — deferred reboot so the reply flushes first. Auth.
 
 POST actions use **HTTP Basic Auth** (`web_user` default `crew` / `web_pass`).
-
----
-
-## Migration runbook (deployed unit)
-
-The deployed unit at **10.189.66.7** runs a secret-baked v1.2.1 image. Cut it over
-to the secret-free, OTA-capable v2.0.0 model **with zero downtime** in two steps.
-(This is a runbook; the build/review workflow does not flash anything.)
-
-1. **Flash a transitional v2.0.0 build** — same source, but with the `DEF_*`
-   placeholders temporarily set to the unit's **real** current secrets (or a local
-   gitignored `config.h`), and with a **real** `public_key.h`. It already contains
-   NVS-first `loadConfig()`, `/provision`, and the signed-OTA module. Flash it over
-   the existing ArduinoOTA/serial while the unit is online; because real secrets
-   are still compiled as defaults, it boots normally and stays on-net (never enters
-   SoftAP).
-2. **Populate NVS over the network** while it's up, with the `/provision` curl in
-   [Provisioning B](#b-authed-network-post-provision-deployed-units--migration)
-   (include `ota_manifest`, `ota_enabled=1`). Confirm `/status.json` shows
-   `"provisioned":true`. Provision from a trusted same-LAN host (Basic Auth is
-   plaintext).
-3. **Cut to the published secret-free build** (CHANGE-ME defaults, via OTA or
-   serial). It reads the real secrets from NVS, comes up normally, and never enters
-   SoftAP. **This first OTA writes the other app slot**, putting the device into the
-   A/B rotation so `esp_ota_*` rollback tracking is live from here on.
-4. **OTA takes over.** Future updates are fully automatic, signed, and
-   health-gated. Fresh units instead boot to SoftAP `tapout-setup` and are set
-   up via the form.
 
 ---
 
