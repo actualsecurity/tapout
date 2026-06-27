@@ -125,7 +125,15 @@ jobs:
           echo "Found signer: $SIGNER"
           echo "path=$SIGNER" >> "$GITHUB_OUTPUT"
 
-      - name: Compile (secret-free image; build_opt.h adds -DUPDATE_SIGN)
+      - name: Inject release version into FW_VERSION (tag is the source of truth)
+        run: |
+          set -euo pipefail
+          V='${{ steps.meta.outputs.version }}'
+          sed -i -E "s/(FW_VERSION[[:space:]]*=[[:space:]]*)\"[^\"]*\"/\1\"${V}\"/" "${SKETCH_DIR}/${SKETCH_NAME}.ino"
+          echo "FW_VERSION pinned to the release tag:"
+          grep -n 'FW_VERSION' "${SKETCH_DIR}/${SKETCH_NAME}.ino"
+
+      - name: Compile (secret-free image)
         run: |
           set -euo pipefail
           mkdir -p build_out
