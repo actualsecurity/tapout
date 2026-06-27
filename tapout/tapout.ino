@@ -244,7 +244,7 @@ static const uint8_t  RINGLOG_N         = 20;          // events kept on flash
 static const uint8_t  RINGLOG_VERSION   = 2;           // bump if blob layout changes (v2 adds simMask)
 
 // Web identity / build stamp.
-static const char* FW_VERSION    = "2.0.3";
+static const char* FW_VERSION    = "2.0.4";
 static const char* FW_BUILD_MARK = __DATE__ " " __TIME__;
 
 // --------------------------- State --------------------------------------
@@ -307,6 +307,10 @@ static uint32_t  lastOtaCheckMs  = 0;        // throttles otaCheckManifest()
 static bool      g_onProbation   = false;    // booted into a freshly-flashed image on trial
 static uint32_t  trialDeadlineMs = 0;        // millis() by which the new image must prove healthy
 static char      otaPendingVer[16] = {0};    // version we are staging / on trial (for status.json)
+// OTA poll visibility: last poll outcome (shown on /status.json; survives the throttle)
+static char      otaLastResult[100] = "(no OTA poll yet)";
+static uint32_t  otaLastResultMs    = 0;
+static uint32_t  lastNoUpdatePingMs = 0;     // throttles the routine "no new version" STATUS ping
 
 // ----- SoftAP setup portal (fresh, unprovisioned units) -----
 static DNSServer dns;
@@ -1012,6 +1016,8 @@ static void handleStatusJson() {
   server.sendContent(String(F(",\"ota_pending_version\":\"")) + otaPendingVer + "\"");
   server.sendContent(String(F(",\"ota_failed_version\":\"")) + C.otaFailedVer + "\"");  // version that flunked probation (skipped)
   server.sendContent(String(F(",\"last_ota_check_ms_ago\":")) + String(lastOtaCheckMs ? (now - lastOtaCheckMs) : 0));
+  server.sendContent(String(F(",\"ota_last_result\":\"")) + otaLastResult + "\"");
+  server.sendContent(String(F(",\"ota_last_result_ms_ago\":")) + String(otaLastResultMs ? (now - otaLastResultMs) : 0));
   server.sendContent(String(F(",\"rollback_possible\":")) + (esp_ota_check_rollback_is_possible() ? "true" : "false"));
   {
     const esp_partition_t* run = esp_ota_get_running_partition();
@@ -1461,27 +1467,23 @@ static bool otaDownloadAndFlash(const String& url, size_t totalSize /* firmware 
   // and requiring it to be strictly newer than what we run AND to match the
   // manifest's claimed version -- so the version is taken from the signed binary,
   // not the attacker-controllable manifest. Reject (no commit) on any mismatch.
-  {
-    const esp_partition_t* upd = esp_ota_get_next_update_partition(NULL);
-    esp_app_desc_t staged;
-    if (!upd || esp_ota_get_partition_description(upd, &staged) != ESP_OK) {
-      Serial.println(F("[ota] cannot read staged image descriptor -- rejecting"));
-      Update.abort(); otaState = PULL_OTA_IDLE; return false;
-    }
-    String stagedVer(staged.version);
-    if (semver(stagedVer) <= semver(FW_VERSION) || stagedVer != String(otaPendingVer)) {
-      Serial.printf("[ota] staged image version '%s' fails downgrade/match gate "
-                    "(running %s, manifest %s) -- rejecting\n",
-                    stagedVer.c_str(), FW_VERSION, otaPendingVer);
-      Update.abort();
-      sendNtfy(C.ntfyStatus.c_str(), "OTA REJECTED",
-               (String("Staged image version ") + stagedVer +
-                " not a forward update matching manifest " + otaPendingVer +
-                " (running " + FW_VERSION + ") -- possible downgrade; ignored.").c_str(),
-               "high", "warning");
-      otaState = PULL_OTA_IDLE;
-      return false;
-    }
+  // Anti-downgrade gate. NOTE: arduino-esp32 sets esp_app_desc.version to a
+  // constant build hash (e.g. "43a8f6d"), NOT our FW_VERSION semver, so the
+  // staged image's descriptor cannot carry the app version. We therefore gate on
+  // the MANIFEST version (otaPendingVer) being strictly newer than what we run
+  // (already enforced in otaCheckManifest; re-asserted here). The image BYTES are
+  // authenticated by the RSA-PSS signature, so no unsigned code can be injected;
+  // the residual risk is a MITM on the setInsecure() 443 path serving an OLDER
+  // genuinely-signed release under an inflated manifest version.
+  // TODO(security): persist a monotonic NVS version floor to also block that.
+  if (semver(otaPendingVer) <= semver(FW_VERSION)) {
+    otaNote("rejected: manifest version not newer than running");
+    Update.abort();
+    sendNtfy(C.ntfyStatus.c_str(), "OTA REJECTED",
+             (String("Manifest ") + otaPendingVer + " not newer than running "
+              + FW_VERSION + " -- ignored.").c_str(), "high", "warning");
+    otaState = PULL_OTA_IDLE;
+    return false;
   }
 
   if (!Update.end(true)) {       // commit: mark the verified slot bootable
@@ -1507,6 +1509,15 @@ static bool otaDownloadAndFlash(const String& url, size_t totalSize /* firmware 
 }
 
 // Fetch the manifest, gate on semver + min_supported, then download+flash.
+// Record an OTA poll outcome for /status.json (LAN-visible even when the egress
+// IP is ntfy-throttled). Serial mirror is for local debugging.
+static void otaNote(const char* msg) {
+  strncpy(otaLastResult, msg, sizeof(otaLastResult) - 1);
+  otaLastResult[sizeof(otaLastResult) - 1] = 0;
+  otaLastResultMs = millis();
+  Serial.printf("[ota] %s\n", msg);
+}
+
 static void otaCheckManifest() {
   if (!otaEnabledAndSafe() || !otaSafeToStart()) return;
   Serial.println(F("[ota] checking manifest"));
@@ -1519,7 +1530,13 @@ static void otaCheckManifest() {
   if (!http.begin(net, C.otaManifest)) return;
   esp_task_wdt_reset();
   int code = http.GET();
-  if (code != HTTP_CODE_OK) { Serial.printf("[ota] manifest HTTP %d\n", code); http.end(); return; }
+  if (code != HTTP_CODE_OK) {
+    char m[72]; snprintf(m, sizeof(m), "poll: manifest fetch failed HTTP %d", code);
+    otaNote(m); http.end();
+    if (millis() - lastNoUpdatePingMs > 21600000UL) { lastNoUpdatePingMs = millis();
+      sendNtfy(C.ntfyStatus.c_str(), "OTA check failed", m, "default", "warning"); }
+    return;
+  }
   String body = http.getString();
   http.end();
   esp_task_wdt_reset();
@@ -1528,11 +1545,14 @@ static void otaCheckManifest() {
   String url  = manifestStr(body, "url");
   uint32_t sz = manifestNum(body, "size");
   String minv = manifestStr(body, "min_supported");
-  if (ver.isEmpty() || url.isEmpty() || sz == 0) { Serial.println(F("[ota] manifest parse failed")); return; }
+  if (ver.isEmpty() || url.isEmpty() || sz == 0) { otaNote("poll: manifest parse failed"); return; }
 
   // Monotonic anti-downgrade gate (ANTI_ROLLBACK fuse is off, so enforce here).
   if (semver(ver) <= semver(FW_VERSION)) {
-    Serial.printf("[ota] no update (have %s, manifest %s)\n", FW_VERSION, ver.c_str());
+    char m[88]; snprintf(m, sizeof(m), "polled: no new version (running %s, latest %s)", FW_VERSION, ver.c_str());
+    otaNote(m);
+    if (millis() - lastNoUpdatePingMs > 21600000UL) { lastNoUpdatePingMs = millis();
+      sendNtfy(C.ntfyStatus.c_str(), "OTA check (no update)", m, "min", "white_check_mark"); }
     return;
   }
 
@@ -1556,8 +1576,14 @@ static void otaCheckManifest() {
 
   strncpy(otaPendingVer, ver.c_str(), sizeof(otaPendingVer) - 1);
   otaPendingVer[sizeof(otaPendingVer) - 1] = 0;
-  Serial.printf("[ota] update available: %s -> %s\n", FW_VERSION, ver.c_str());
-  otaDownloadAndFlash(url, sz);     // returns only on failure (success reboots)
+  char m[96]; snprintf(m, sizeof(m), "update %s available -> downloading", ver.c_str());
+  otaNote(m);
+  sendNtfy(C.ntfyStatus.c_str(), "OTA downloading", m, "default", "arrow_down");
+  if (!otaDownloadAndFlash(url, sz)) {     // returns ONLY on failure (success reboots into the new image)
+    char f[100]; snprintf(f, sizeof(f), "download/flash of %s FAILED (rejected/timeout/size) -- staying on %s", ver.c_str(), FW_VERSION);
+    otaNote(f);
+    sendNtfy(C.ntfyStatus.c_str(), "OTA FAILED", f, "high", "warning");
+  }
 }
 
 // POST /check-ota (auth). Manual trigger + full diagnosis: reports every OTA gate
