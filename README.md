@@ -5,7 +5,7 @@ pushes a notification to crew phones. **Secondary/convenience layer only — the
 hard-wired fire bell stays primary.** The device always boots to a working ring
 alerter even if NTP, the web page, OTA, mDNS, and provisioning all fail.
 
-**Firmware: v2.0.4**
+**Firmware: v2.0.5**
 
 ## What's new in v2.0.0
 
