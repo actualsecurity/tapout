@@ -1,0 +1,8 @@
+{
+  "version": "2.0.1",
+  "url": "https://github.com/<org>/firehouse-ring-alerter/releases/download/v2.0.1/firehouse_ring_alert.signed.bin",
+  "size": 1389056,
+  "sha256": "<lowercase hex sha256 of the SIGNED .bin (firmware + 512-byte signature trailer)>",
+  "min_supported": "2.0.0",
+  "notes": "Health-gated; auto-rolls back if unhealthy within 60s."
+}

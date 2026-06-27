@@ -1,0 +1,245 @@
+name: firmware
+
+# Build, SIGN, and publish the firehouse-ring-alerter firmware (RAIL A of the
+# signed pull-OTA pipeline). The compiled .bin is SECRET-FREE (CHANGE-ME
+# placeholders only) so it is safe to publish from a PUBLIC repo. Authenticity
+# is anchored by the embedded RSA-2048 PUBLIC key in public_key.h; the matching
+# PRIVATE key never leaves the GitHub Actions secret OTA_SIGNING_KEY.
+#
+# Triggers:
+#   - push of a v* tag   -> release version comes from the tag (e.g. v2.0.1)
+#   - manual dispatch    -> you supply the version + notes
+#
+# Owner action required (one time):
+#   1. Generate keys locally (see tools/keygen-instructions.md), commit the
+#      regenerated firehouse_ring_alert/public_key.h, and DO NOT commit the
+#      private key.
+#   2. Add the repo secret  OTA_SIGNING_KEY  = full PEM contents of
+#      private_key.pem  (Settings -> Secrets and variables -> Actions).
+#   3. (optional) repo variable  OTA_MIN_SUPPORTED  to gate downgrade skips
+#      (defaults to 2.0.0).
+#   4. Settings -> Actions -> General -> Workflow permissions: "Read and write"
+#      (this workflow also sets `permissions: contents: write` below).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, no leading v (e.g. 2.0.1)'
+        required: true
+        type: string
+      min_supported:
+        description: 'Minimum running version allowed to take this update'
+        required: false
+        default: '2.0.0'
+        type: string
+      notes:
+        description: 'Release notes for the manifest'
+        required: false
+        default: 'Health-gated; auto-rolls back if unhealthy within 60s.'
+        type: string
+
+permissions:
+  contents: write   # create releases + commit ota/manifest.json back to main
+
+env:
+  ESP32_CORE_VERSION: '3.3.10'
+  FQBN: 'esp32:esp32:nano_nora'
+  SKETCH_DIR: 'firehouse_ring_alert'
+  SKETCH_NAME: 'firehouse_ring_alert'
+
+jobs:
+  build-sign-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history; needed to push manifest back to main)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version + manifest inputs
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            REF="${GITHUB_REF#refs/tags/}"   # v2.0.1
+            VERSION="${REF#v}"               # 2.0.1
+          else
+            VERSION="${{ github.event.inputs.version }}"
+          fi
+          # strict semver MAJOR.MINOR.PATCH (matches firmware semver() parser)
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Version '$VERSION' is not strict semver MAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          MIN_SUPPORTED="${{ github.event.inputs.min_supported || vars.OTA_MIN_SUPPORTED || '2.0.0' }}"
+          NOTES="${{ github.event.inputs.notes || 'Health-gated; auto-rolls back if unhealthy within 60s.' }}"
+          {
+            echo "version=$VERSION"
+            echo "tag=v$VERSION"
+            echo "min_supported=$MIN_SUPPORTED"
+            echo "notes=$NOTES"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building firmware version $VERSION (min_supported $MIN_SUPPORTED)"
+
+      - name: Fail if public_key.h is still the placeholder
+        run: |
+          set -euo pipefail
+          if grep -q 'CHANGE-ME' "${SKETCH_DIR}/public_key.h"; then
+            echo "::error::${SKETCH_DIR}/public_key.h is still the dummy placeholder key."
+            echo "::error::Generate real keys (tools/keygen-instructions.md), commit public_key.h, set OTA_SIGNING_KEY, then retry."
+            exit 1
+          fi
+
+      - name: Install arduino-cli
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR="$HOME/bin" sh
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Install esp32 core ${{ env.ESP32_CORE_VERSION }}
+        run: |
+          set -euo pipefail
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls \
+            https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install "esp32:esp32@${ESP32_CORE_VERSION}"
+          arduino-cli core list
+
+      - name: Install signing dependency (cryptography)
+        run: python3 -m pip install --user --upgrade cryptography
+
+      - name: Locate esp32 core bin_signing.py
+        id: signer
+        run: |
+          set -euo pipefail
+          SIGNER="$(find "$HOME/.arduino15" -path "*esp32/hardware/esp32/${ESP32_CORE_VERSION}/tools/bin_signing.py" | head -1)"
+          if [ -z "$SIGNER" ]; then
+            echo "::error::Could not find bin_signing.py in the installed esp32 core"
+            exit 1
+          fi
+          echo "Found signer: $SIGNER"
+          echo "path=$SIGNER" >> "$GITHUB_OUTPUT"
+
+      - name: Compile (secret-free image; build_opt.h adds -DUPDATE_SIGN)
+        run: |
+          set -euo pipefail
+          mkdir -p build_out
+          arduino-cli compile \
+            --fqbn "${FQBN}" \
+            --export-binaries \
+            --output-dir build_out \
+            --warnings default \
+            "./${SKETCH_DIR}"
+          echo "Build artifacts:"
+          ls -la build_out
+
+      - name: Write private key from secret
+        env:
+          OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OTA_SIGNING_KEY:-}" ]; then
+            echo "::error::Repo secret OTA_SIGNING_KEY is not set."
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$OTA_SIGNING_KEY" > private_key.pem
+          # sanity: it must be a private key PEM
+          grep -q 'PRIVATE KEY' private_key.pem || { echo "::error::OTA_SIGNING_KEY does not look like a PEM private key"; exit 1; }
+
+      - name: Sign firmware (RSA-PSS / SHA-256 -> 512-byte trailer)
+        run: |
+          set -euo pipefail
+          UNSIGNED="build_out/${SKETCH_NAME}.ino.bin"
+          test -f "$UNSIGNED" || { echo "::error::Unsigned bin not found: $UNSIGNED"; ls -la build_out; exit 1; }
+          python3 "${{ steps.signer.outputs.path }}" \
+            --bin  "$UNSIGNED" \
+            --key  private_key.pem \
+            --out  "build_out/${SKETCH_NAME}.signed.bin" \
+            --hash sha256
+
+      - name: Verify the signature against the embedded public key
+        run: |
+          set -euo pipefail
+          # Re-derive the public key from the private key and confirm the signed
+          # image verifies. (Belt-and-suspenders: if CI signs with a key whose
+          # public half is NOT the committed public_key.h, the device would
+          # reject the OTA at Update.end() — better to fail here.)
+          python3 "${{ steps.signer.outputs.path }}" --extract-pubkey private_key.pem --out ci_pub.pem
+          python3 "${{ steps.signer.outputs.path }}" --verify "build_out/${SKETCH_NAME}.signed.bin" --pubkey ci_pub.pem
+
+      - name: Build ota/manifest.json
+        id: manifest
+        run: |
+          set -euo pipefail
+          SIGNED="build_out/${SKETCH_NAME}.signed.bin"
+          SIZE="$(stat -c%s "$SIGNED")"
+          SHA="$(sha256sum "$SIGNED" | cut -d' ' -f1)"
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ steps.meta.outputs.tag }}/${SKETCH_NAME}.signed.bin"
+          # Write to a stable temp path so it survives the branch switch in the
+          # commit step (the working-tree copy gets discarded by `checkout -f`).
+          cat > "${RUNNER_TEMP}/manifest.json" <<EOF
+          {
+            "version": "${{ steps.meta.outputs.version }}",
+            "url": "${URL}",
+            "size": ${SIZE},
+            "sha256": "${SHA}",
+            "min_supported": "${{ steps.meta.outputs.min_supported }}",
+            "notes": "${{ steps.meta.outputs.notes }}"
+          }
+          EOF
+          echo "Generated manifest:"
+          cat "${RUNNER_TEMP}/manifest.json"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+
+      - name: Shred private key (never persist beyond signing)
+        if: always()
+        run: rm -f private_key.pem ci_pub.pem
+
+      - name: Create / update GitHub Release (signed OTA + unsigned recovery bin)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          # NEVER esptool-flash the .signed.bin (it carries the 512-byte trailer);
+          # the .ino.bin is the plain image for serial recovery.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              "build_out/${SKETCH_NAME}.signed.bin" \
+              "build_out/${SKETCH_NAME}.ino.bin" --clobber
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes "${{ steps.meta.outputs.notes }} (sha256 ${{ steps.manifest.outputs.sha }})" \
+              "build_out/${SKETCH_NAME}.signed.bin" \
+              "build_out/${SKETCH_NAME}.ino.bin"
+          fi
+
+      - name: Commit ota/manifest.json to main (the file the device polls)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          git fetch origin "$DEFAULT_BRANCH"
+          # force-switch (discards the working-tree manifest; we have the temp copy)
+          git checkout -f "$DEFAULT_BRANCH"
+          git reset --hard "origin/${DEFAULT_BRANCH}"
+          mkdir -p ota
+          cp "${RUNNER_TEMP}/manifest.json" ota/manifest.json
+          git add ota/manifest.json
+          if git diff --cached --quiet; then
+            echo "manifest unchanged; nothing to commit"
+          else
+            git commit -m "ci: publish ota/manifest.json for ${{ steps.meta.outputs.tag }}"
+            git push origin "HEAD:${DEFAULT_BRANCH}"
+          fi

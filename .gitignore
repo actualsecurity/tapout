@@ -1,0 +1,38 @@
+# =============================================================================
+# Secrets & signing keys -- NEVER commit these.
+# The PRIVATE OTA signing key lives only in the GH Actions secret OTA_SIGNING_KEY.
+# =============================================================================
+private_key.pem
+ci_pub.pem
+*.pem
+# ...but the PUBLIC key is intentionally tracked (it is not a secret):
+!public_key.pem
+
+# Provisioning / secret config (real secrets live in NVS, never in the image):
+secrets.h
+config.h
+firehouse_ring_alert/secrets.h
+firehouse_ring_alert/config.h
+
+# =============================================================================
+# Build artifacts
+# =============================================================================
+build/
+build_out/
+*.ino.bin
+*.signed.bin
+*.ino.elf
+*.ino.map
+*.ino.bootloader.bin
+*.ino.partitions.bin
+
+# =============================================================================
+# Editor / OS noise
+# =============================================================================
+.DS_Store
+.vscode/
+*.swp
+
+# Obsolete debug sketches with hardcoded test creds -- never publish
+wifi_diag/
+diag_led/
