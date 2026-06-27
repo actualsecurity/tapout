@@ -244,7 +244,7 @@ static const uint8_t  RINGLOG_N         = 20;          // events kept on flash
 static const uint8_t  RINGLOG_VERSION   = 2;           // bump if blob layout changes (v2 adds simMask)
 
 // Web identity / build stamp.
-static const char* FW_VERSION    = "2.0.7";
+static const char* FW_VERSION    = "2.0.8";
 static const char* FW_BUILD_MARK = __DATE__ " " __TIME__;
 
 // --------------------------- State --------------------------------------
@@ -927,6 +927,10 @@ static void handleRoot() {
          "<form method='POST' action='/simulate-ring' style='display:inline' "
          "onsubmit=\"return confirm('Quiet plumbing test -> STATUS only, crew NOT paged?')\">"
          "<button>Quiet test (STATUS)</button></form> &nbsp; "
+         "<form method='POST' action='/check-ota' style='display:inline' "
+         "onsubmit=\"return confirm('Check GitHub for a firmware update now? If a newer "
+         "signed version exists, the device will download + flash it.')\">"
+         "<button>Check for update</button></form> &nbsp; "
          "<form method='POST' action='/reboot' style='display:inline' "
          "onsubmit=\"return confirm('Reboot the alerter?')\">"
          "<button>Reboot</button></form>"
