@@ -1,11 +1,11 @@
 # Firmware-signing key setup (RAIL A)
 
-The firehouse-ring-alerter only flashes pull-OTA images whose RSA-2048 / RSA-PSS /
+Tapout only flashes pull-OTA images whose RSA-2048 / RSA-PSS /
 SHA-256 signature verifies against the **public key embedded in the running
-firmware** (`firehouse_ring_alert/public_key.h`). The matching **private key**
+firmware** (`tapout/public_key.h`). The matching **private key**
 signs builds in CI and must **never** be committed.
 
-- **public key** -> committed to the repo as `firehouse_ring_alert/public_key.h`
+- **public key** -> committed to the repo as `tapout/public_key.h`
   (a public key is not a secret). OTA stays **disabled** while that file is the
   shipped placeholder (it contains the literal `CHANGE-ME`).
 - **private key** -> lives **only** in the GitHub Actions secret
@@ -47,8 +47,8 @@ That command writes **two** files next to `--out`:
 Copy the generated header into the sketch (overwrites the placeholder):
 
 ```sh
-cp public_key.h firehouse_ring_alert/public_key.h
-git add firehouse_ring_alert/public_key.h
+cp public_key.h tapout/public_key.h
+git add tapout/public_key.h
 git commit -m "Add real OTA signing public key (enables signed pull-OTA)"
 ```
 
@@ -80,8 +80,8 @@ rm -P private_key.pem    # macOS secure delete (Linux: shred -u private_key.pem)
 ## 4. (optional) Verify a signed build locally
 
 ```sh
-tools/sign_firmware.sh build_out/firehouse_ring_alert.ino.bin private_key.pem build_out/firehouse_ring_alert.signed.bin
-python3 "$CORE/tools/bin_signing.py" --verify build_out/firehouse_ring_alert.signed.bin --pubkey public_key.pem
+tools/sign_firmware.sh build_out/tapout.ino.bin private_key.pem build_out/tapout.signed.bin
+python3 "$CORE/tools/bin_signing.py" --verify build_out/tapout.signed.bin --pubkey public_key.pem
 ```
 
 ## Rules

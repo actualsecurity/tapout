@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # =============================================================================
-# sign_firmware.sh -- sign a compiled firehouse-ring-alerter image with the
+# sign_firmware.sh -- sign a compiled tapout image with the
 # esp32 Arduino core's bin_signing.py (RSA-PSS / SHA-256 -> 512-byte trailer).
 #
 # This is the LOCAL equivalent of the "Sign firmware" step in
@@ -12,9 +12,9 @@
 #
 # Example (after `arduino-cli compile --export-binaries --output-dir build_out`):
 #   tools/sign_firmware.sh \
-#       build_out/firehouse_ring_alert.ino.bin \
+#       build_out/tapout.ino.bin \
 #       private_key.pem \
-#       build_out/firehouse_ring_alert.signed.bin
+#       build_out/tapout.signed.bin
 #
 # Publish the .signed.bin as the OTA asset and put its sha256/size into
 # ota/manifest.json. NEVER esptool-flash a .signed.bin (the 512-byte trailer
@@ -29,7 +29,7 @@
 #   python3 "$CORE/tools/bin_signing.py" --generate-key rsa-2048 --out private_key.pem
 #   python3 "$CORE/tools/bin_signing.py" --extract-pubkey private_key.pem --out public_key.pem
 #   #   ^ this ALSO writes public_key.h next to public_key.pem
-#   cp public_key.h firehouse_ring_alert/public_key.h   # commit this (public key is not secret)
+#   cp public_key.h tapout/public_key.h   # commit this (public key is not secret)
 #
 #   # Option B -- equivalent with openssl (RSA-2048):
 #   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out private_key.pem

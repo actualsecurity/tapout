@@ -1,7 +1,7 @@
 /*
- * Firehouse Phone-Ring Alerter
+ * Tapout
  * -------------------------------------------------------------------------
- * Detects when the firehouse POTS line rings (via an ELK-930 ring detector)
+ * Detects when the station POTS line rings (via an ELK-930 ring detector)
  * and sends a push notification to crew phones over WiFi (ntfy.sh by default).
  *
  * THIS IS A SECONDARY / CONVENIENCE LAYER. The physical fire bell remains the
@@ -34,7 +34,7 @@
  *   - Persistent (NVS) rolling ring-event log that survives reboots/brownouts
  *   - Low-heap canary warning on the STATUS topic
  *   - ArduinoOTA WiFi reflash (password-protected, watchdog-safe, LED feedback)
- *   - ESPmDNS + LAN status web page (http://firehouse-alerter.local) with a
+ *   - ESPmDNS + LAN status web page (http://tapout.local) with a
  *     /status.json endpoint and auth-gated reboot / send-test actions
  *   - Hardware task watchdog (esp_task_wdt) with periodic feed
  *   - Hourly heartbeat ping (now carries a monotonic heartbeat_seq + largest
@@ -78,7 +78,7 @@
 #include <HTTPClient.h>
 #include <esp_task_wdt.h>
 #include <ArduinoOTA.h>     // pulls in Update; bundled with esp32 core v3.x
-#include <ESPmDNS.h>        // mDNS responder (firehouse-alerter.local)
+#include <ESPmDNS.h>        // mDNS responder (tapout.local)
 #include <WebServer.h>      // LAN status page + JSON
 #include <Preferences.h>    // NVS: boot counter + persistent ring log
 #include <esp_system.h>     // esp_reset_reason()
@@ -116,7 +116,7 @@ static const char* DEF_NTP2         = "pool.ntp.org";  // needs DNS + UDP 123 ou
 static const char* DEF_NTP3         = "time.nist.gov";
 static const char* DEF_DEADMAN      = "";              // dead-man's-switch URL ("" = disabled)
 // Pull-OTA manifest URL. "" => pull-OTA disabled. Example:
-//   https://raw.githubusercontent.com/<org>/firehouse-ring-alerter/main/ota/manifest.json
+//   https://raw.githubusercontent.com/<org>/tapout/main/ota/manifest.json
 static const char* DEF_OTA_MANIFEST = "";
 
 static const uint32_t DEADMAN_PING_MS = 15UL*60UL*1000UL;  // >= 5 min; longer than WiFi flaps
@@ -566,7 +566,7 @@ static void announceOnlineOnce() {
     "Reconnected to WiFi. Boot #%lu, last reset: %s, free heap %u B. "
     "This is just a test, not a real call.",
     (unsigned long)bootCount, gResetReason, (unsigned)ESP.getFreeHeap());
-  if (sendNtfy(C.ntfyStatus.c_str(), "Firehouse alerter restarted",
+  if (sendNtfy(C.ntfyStatus.c_str(), "Tapout restarted",
                msg, "low", "white_check_mark")) {
     onlineAnnounced = true;
   }
@@ -664,7 +664,7 @@ static void fireCallAlert(bool simulated) {
   // (callSimToCall), which goes to the CALL topic with a [SIM/COMMISSIONING
   // TEST] title to prove the crew subscription actually receives.
   const char* url   = C.ntfyCall.c_str();
-  const char* title = "FIREHOUSE PHONE RINGING";
+  const char* title = "STATION PHONE RINGING";
   const char* prio  = "max";
   const char* tags  = "rotating_light,fire_engine";
   if (simulated) {
@@ -674,13 +674,13 @@ static void fireCallAlert(bool simulated) {
       // but clearly TEST-labeled so nobody rolls a truck. Never counts as a real
       // delivered call (realCallsDelivered only ticks when !simulated).
       url   = C.ntfyCall.c_str();
-      title = "[TEST] FIREHOUSE PHONE RINGING -- not a real call";
+      title = "[TEST] STATION PHONE RINGING -- not a real call";
       prio  = "max";
       tags  = "test_tube,rotating_light";
     } else {
       // Quiet plumbing test (?quiet=1 / ?topic=status): STATUS only, crew not paged.
       url   = C.ntfyStatus.c_str();
-      title = "[SIM] FIREHOUSE PHONE RINGING (quiet test, crew not paged)";
+      title = "[SIM] STATION PHONE RINGING (quiet test, crew not paged)";
       prio  = "default";
       tags  = "test_tube";
     }
@@ -725,9 +725,9 @@ static void serviceCallQueue() {
 
 // ============================ OTA ======================================
 // Keep hostname IDENTICAL to WiFi.setHostname() so mDNS, OTA and firewall
-// lists all agree: "firehouse-alerter" -> firehouse-alerter.local:3232.
+// lists all agree: "tapout" -> tapout.local:3232.
 static void setupOTA() {
-  ArduinoOTA.setHostname("firehouse-alerter");
+  ArduinoOTA.setHostname("tapout");
   ArduinoOTA.setPassword(C.otaPass.c_str());   // espota must present this to flash
   // Default OTA port 3232 (TCP) -- left default so the flash command is simple.
 
@@ -765,7 +765,7 @@ static void setupOTA() {
   });
 
   ArduinoOTA.begin();                     // also starts the mDNS responder
-  Serial.println(F("[ota] ready: firehouse-alerter.local:3232"));
+  Serial.println(F("[ota] ready: tapout.local:3232"));
 }
 
 // Arm OTA + advertise mDNS http service exactly once, after WiFi is up.
@@ -775,7 +775,7 @@ static void armNetworkServices() {
     // Fail CLOSED: do not arm OTA with the shipped default password -- anyone who
     // read this source could otherwise push arbitrary firmware. Still bring up the
     // mDNS responder so the read-only status page stays reachable at .local.
-    MDNS.begin("firehouse-alerter");
+    MDNS.begin("tapout");
     MDNS.addService("http", "tcp", 80);
     netServicesArmed = true;
     Serial.println(F("[net] OTA DISABLED -- OTA_PASSWORD still default; mDNS http only"));
@@ -820,7 +820,7 @@ static void handleRoot() {
          "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>"
          "<meta name='viewport' content='width=device-width,initial-scale=1'>"
          "<meta http-equiv='refresh' content='10'>"
-         "<title>Firehouse Ring Alerter</title><style>"
+         "<title>Tapout</title><style>"
          "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;"
          "margin:0;background:#0f1115;color:#e6e6e6}"
          ".wrap{max-width:680px;margin:0 auto;padding:16px}"
@@ -839,8 +839,8 @@ static void handleRoot() {
          ".log{font-family:ui-monospace,Menlo,monospace;font-size:.85rem}"
          "</style></head><body><div class='wrap'>"));
 
-  server.sendContent(F("<h1>Firehouse Ring Alerter</h1>"));
-  server.sendContent(String(F("<div class='sub'>firehouse-alerter &nbsp;&bull;&nbsp; fw "))
+  server.sendContent(F("<h1>Tapout</h1>"));
+  server.sendContent(String(F("<div class='sub'>tapout &nbsp;&bull;&nbsp; fw "))
                      + FW_VERSION + F("</div>"));
 
   // security banner if shipped default credentials are still in place
@@ -948,7 +948,7 @@ static void handleStatusJson() {
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");
 
-  server.sendContent(F("{\"device\":\"firehouse-alerter\""));
+  server.sendContent(F("{\"device\":\"tapout\""));
   server.sendContent(String(F(",\"fw_version\":\""))   + FW_VERSION + "\"");
   server.sendContent(String(F(",\"fw_build\":\""))     + FW_BUILD_MARK + "\"");
   server.sendContent(String(F(",\"time_synced\":"))    + (timeSynced() ? "true" : "false"));
@@ -1050,7 +1050,7 @@ static void handleStatusJson() {
 // POST /send-test (auth). Sends to STATUS topic so it never pages the crew.
 static void handleSendTest() {
   if (!requireAuth()) return;
-  bool ok = sendNtfy(C.ntfyStatus.c_str(), "Firehouse alerter TEST",
+  bool ok = sendNtfy(C.ntfyStatus.c_str(), "Tapout TEST",
                      "Manual test alert from the status page. Not a real call.",
                      "default", "test_tube");
   esp_task_wdt_reset();
@@ -1167,14 +1167,14 @@ static void handleSetupForm() {
   server.sendContent(F(
     "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>Firehouse Alerter Setup</title><style>"
+    "<title>Tapout Setup</title><style>"
     "body{font-family:system-ui,sans-serif;margin:0;background:#0f1115;color:#e6e6e6}"
     ".wrap{max-width:520px;margin:0 auto;padding:16px}"
     "h1{font-size:1.2rem}label{display:block;margin:10px 0 3px;color:#9aa3af;font-size:.85rem}"
     "input{width:100%;box-sizing:border-box;padding:8px;border-radius:8px;border:1px solid #333;"
     "background:#1a1d24;color:#e6e6e6}button{margin-top:16px;padding:10px 16px;border-radius:8px;"
     "border:0;background:#2563eb;color:#fff;font-weight:600}.sub{color:#9aa3af;font-size:.8rem}"
-    "</style></head><body><div class='wrap'><h1>Firehouse Ring Alerter setup</h1>"
+    "</style></head><body><div class='wrap'><h1>Tapout setup</h1>"
     "<p class='sub'>This device is UNPROVISIONED. Enter your settings; they are stored in "
     "on-device NVS, never in the firmware image. Passwords are write-only.</p>"
     "<form method='POST' action='/save'>"
@@ -1211,18 +1211,18 @@ static String setupApPassphrase() {
   return String(buf);
 }
 
-// SoftAP captive portal for fresh units. WPA2-protected AP "firehouse-setup" at
+// SoftAP captive portal for fresh units. WPA2-protected AP "tapout-setup" at
 // 192.168.4.1; DNS catch-all bounces every host to the form. handleRing() keeps
 // running in the setup loop (life-safety path stays armed); ntfy delivery is
 // simply suppressed because WiFi STA is not connected.
 static void startSetupPortal() {
   inSetupMode = true;
   String pass = setupApPassphrase();
-  Serial.println(F("[setup] UNPROVISIONED -> starting SoftAP 'firehouse-setup' (192.168.4.1)"));
+  Serial.println(F("[setup] UNPROVISIONED -> starting SoftAP 'tapout-setup' (192.168.4.1)"));
   Serial.printf("[setup] AP is WPA2-protected; passphrase for THIS unit: %s\n", pass.c_str());
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
-  WiFi.softAP("firehouse-setup", pass.c_str());      // WPA2-protected (per-device key)
+  WiFi.softAP("tapout-setup", pass.c_str());      // WPA2-protected (per-device key)
   dns.start(53, "*", WiFi.softAPIP());               // captive catch-all (async; do NOT poll)
 
   server.on("/",     HTTP_GET,  handleSetupForm);
@@ -1641,7 +1641,7 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println();
-  Serial.println(F("[boot] Firehouse Phone-Ring Alerter starting..."));
+  Serial.println(F("[boot] Tapout starting..."));
 
   // ---- Boot diagnostics: reset reason + persistent boot counter ----------
   bootReason   = esp_reset_reason();
@@ -1695,13 +1695,13 @@ void setup() {
 
   // ---- UNPROVISIONED? -> SoftAP setup portal (never brick) ---------------
   // No real WiFi config in NVS (fresh unit, or wifi_ssid still CHANGE-ME): bring
-  // up the captive "firehouse-setup" AP and serve the provisioning form. The ring
+  // up the captive "tapout-setup" AP and serve the provisioning form. The ring
   // detector STAYS ARMED in this loop (handleRing runs); only ntfy delivery is
   // suppressed because there is no STA link. We never fall through to normal init;
   // a successful /save reboots into normal mode.
   if (!isProvisioned()) {
     startSetupPortal();
-    Serial.println(F("[setup] portal up -- join WiFi 'firehouse-setup', browse to 192.168.4.1"));
+    Serial.println(F("[setup] portal up -- join WiFi 'tapout-setup', browse to 192.168.4.1"));
     uint32_t lastBlink = 0;
     bool blinkOn = false;
     for (;;) {
@@ -1723,7 +1723,7 @@ void setup() {
   // ---- WiFi --------------------------------------------------------------
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);         // keep radio responsive; this is mains-powered
-  WiFi.setHostname("firehouse-alerter");  // identifiable in DHCP/firewall lists
+  WiFi.setHostname("tapout");  // identifiable in DHCP/firewall lists
   WiFi.begin(C.wifiSsid.c_str(), C.wifiPass.c_str());
   Serial.print(F("[wifi] connecting"));
   uint32_t start = millis();
@@ -1935,7 +1935,7 @@ static void handleHeartbeat() {
            "boot: %lu. Free heap %u B, largest block %u B.",
            (unsigned long)heartbeatSeq, ts, (unsigned long)ringCount,
            (unsigned)ESP.getFreeHeap(), (unsigned)largest);
-  sendNtfy(C.ntfyStatus.c_str(), "Firehouse alerter heartbeat",
+  sendNtfy(C.ntfyStatus.c_str(), "Tapout heartbeat",
            msg, "min", "green_heart");
 }
 

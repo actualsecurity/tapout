@@ -11,8 +11,8 @@ ci_pub.pem
 # Provisioning / secret config (real secrets live in NVS, never in the image):
 secrets.h
 config.h
-firehouse_ring_alert/secrets.h
-firehouse_ring_alert/config.h
+tapout/secrets.h
+tapout/config.h
 
 # =============================================================================
 # Build artifacts

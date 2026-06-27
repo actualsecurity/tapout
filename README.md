@@ -1,6 +1,6 @@
-# Firehouse Phone-Ring Alerter
+# Tapout
 
-An always-on ESP32 device that detects when the firehouse POTS line rings and
+An always-on ESP32 device that detects when the station POTS line rings and
 pushes a notification to crew phones. **Secondary/convenience layer only — the
 hard-wired fire bell stays primary.** The device always boots to a working ring
 alerter even if NTP, the web page, OTA, mDNS, and provisioning all fail.
@@ -17,7 +17,7 @@ and adds three things so the device can update itself safely over the internet:
    a **public** repo. Real WiFi/ntfy/password values live in the NVS namespace
    `fhacfg` and are loaded at boot. See [Provisioning](#provisioning-secrets-in-nvs).
 2. **First-boot SoftAP setup portal + network `/provision`.** Fresh units boot a
-   captive-portal AP (`firehouse-setup`) to enter secrets; already-deployed units
+   captive-portal AP (`tapout-setup`) to enter secrets; already-deployed units
    can be re-provisioned over the LAN with an authed `POST /provision`. See
    [Provisioning](#provisioning-secrets-in-nvs).
 3. **Signed, fully-automatic GitHub pull-OTA with health-gated auto-rollback.**
@@ -73,7 +73,7 @@ These all still work in v2.0.0 and run **before** any of the new code each loop:
   until delivered; if delivery ultimately fails it surfaces a failure notice on
   the STATUS topic. Retries are *not* burned while WiFi is down.
 - **NTP wall-clock timestamps** on CALL alerts (graceful uptime fallback).
-- **mDNS + LAN status web page** at `http://firehouse-alerter.local`, with a
+- **mDNS + LAN status web page** at `http://tapout.local`, with a
   `/status.json` endpoint and auth-gated reboot / send-test / simulate actions.
 - **Persistent NVS ring log** — rolling log of the last 20 ring events, survives
   reboots and brownouts.
@@ -117,9 +117,9 @@ are two ways to write the NVS config.
 If the device is **not provisioned**, it does **not** join WiFi as a station.
 Instead it starts an open SoftAP captive portal and waits for setup:
 
-1. Power the device. It brings up WiFi AP **`firehouse-setup`** at
+1. Power the device. It brings up WiFi AP **`tapout-setup`** at
    `http://192.168.4.1` (captive DNS catch-all redirects any host to the form).
-2. Join `firehouse-setup` from a phone/laptop; the setup form opens.
+2. Join `tapout-setup` from a phone/laptop; the setup form opens.
 3. Fill in WiFi SSID/password, the ntfy CALL and STATUS URLs, the web-admin and
    OTA passwords, timezone, NTP server(s), optional dead-man URL, the OTA
    manifest URL, **Enable auto pull-OTA? (1/0)**, and the OTA check interval
@@ -146,7 +146,7 @@ curl -u crew:<webpass> -X POST 'http://<device-ip>/provision' \
   -d 'web_pass=<new-web-pass>' \
   -d 'ota_pass=<new-ota-pass>' \
   -d 'tz=EST5EDT,M3.2.0,M11.1.0' \
-  -d 'ota_manifest=https://raw.githubusercontent.com/<org>/firehouse-ring-alerter/main/ota/manifest.json' \
+  -d 'ota_manifest=https://raw.githubusercontent.com/<org>/tapout/main/ota/manifest.json' \
   -d 'ota_enabled=1' \
   -d 'ota_interval=360'
 ```
@@ -250,7 +250,7 @@ lifecycle: staged → committed / rolled-back / rejected / skipped.
 
 > **CRITICAL — never esptool-flash a `.signed.bin`.** The signed image is for
 > **OTA only** (it carries the 512-byte signature trailer the verifier expects).
-> For USB/serial recovery use the **unsigned** `firehouse_ring_alert.ino.bin`,
+> For USB/serial recovery use the **unsigned** `tapout.ino.bin`,
 > which CI also publishes.
 
 ---
@@ -260,8 +260,8 @@ lifecycle: staged → committed / rolled-back / rejected / skipped.
 The repo root is published to a **public** GitHub org repo. Layout:
 
 ```
-firehouse_ring_alert/
-  firehouse_ring_alert.ino     # the one sketch (v2.0.0)
+tapout/
+  tapout.ino     # the one sketch (v2.0.0)
   build_opt.h                  # one line: -DUPDATE_SIGN  (enables signature verify)
   public_key.h                 # COMMITTED public key (not a secret); placeholder until generated
   config.example.h             # documents NVS fields + a sample /provision curl (no secrets)
@@ -280,7 +280,7 @@ tools/
 ```
 python <CORE>/tools/bin_signing.py --generate-key rsa-2048 --out private_key.pem
 python <CORE>/tools/bin_signing.py --extract-pubkey private_key.pem --out public_key.pem
-cp public_key.h firehouse_ring_alert/public_key.h   # overwrites the placeholder
+cp public_key.h tapout/public_key.h   # overwrites the placeholder
 ```
 
 where `<CORE>` is `~/Library/Arduino15/packages/esp32/hardware/esp32/3.3.10`.
@@ -297,7 +297,7 @@ The device fetches this raw from `main`. Shape:
 ```json
 {
   "version": "2.0.1",
-  "url": "https://github.com/<org>/firehouse-ring-alerter/releases/download/v2.0.1/firehouse_ring_alert.signed.bin",
+  "url": "https://github.com/<org>/tapout/releases/download/v2.0.1/tapout.signed.bin",
   "size": 1389056,
   "sha256": "<hex sha256 of the signed .bin>",
   "min_supported": "2.0.0",
@@ -315,10 +315,10 @@ Triggers on `push` of a `v*` tag and on manual `workflow_dispatch`:
 1. Checkout; install `arduino-cli`; `arduino-cli core install esp32:esp32@3.3.10`.
 2. `pip install cryptography`.
 3. `arduino-cli compile --fqbn esp32:esp32:nano_nora --export-binaries
-   ./firehouse_ring_alert` (picks up `build_opt.h` automatically) →
-   `firehouse_ring_alert.ino.bin`.
+   ./tapout` (picks up `build_opt.h` automatically) →
+   `tapout.ino.bin`.
 4. Write the private key from the secret: `echo "$OTA_SIGNING_KEY" > private_key.pem`.
-5. Sign → `firehouse_ring_alert.signed.bin` via the core's `bin_signing.py`.
+5. Sign → `tapout.signed.bin` via the core's `bin_signing.py`.
 6. `sha256sum` the signed file and write `ota/manifest.json` (version from the
    tag, release-asset URL, size, sha256, min_supported, notes).
 7. `gh release create` uploading **both** the `.signed.bin` (OTA) and the
@@ -343,14 +343,14 @@ Triggers on `push` of a `v*` tag and on manual `workflow_dispatch`:
 arduino-cli compile \
   --fqbn esp32:esp32:nano_nora \
   --output-dir build \
-  firehouse_ring_alert
+  tapout
 ```
 
 The **first** flash of a fresh unit is over **USB**:
 
 ```
 arduino-cli upload -p /dev/cu.usbmodemXXXX \
-  --fqbn esp32:esp32:nano_nora firehouse_ring_alert
+  --fqbn esp32:esp32:nano_nora tapout
 ```
 
 Requires the **esp32 by Espressif** core **v3.3.10**. No extra libraries —
@@ -366,7 +366,7 @@ Requires the **esp32 by Espressif** core **v3.3.10**. No extra libraries —
 
 ## Web status page
 
-Reachable on the LAN at **`http://firehouse-alerter.local`** (or the device IP)
+Reachable on the LAN at **`http://tapout.local`** (or the device IP)
 once WiFi is up and inbound TCP 80 is permitted.
 
 > **Operational note — prefer the IP:** mDNS `.local` resolution is slow/flaky
@@ -414,7 +414,7 @@ to the secret-free, OTA-capable v2.0.0 model **with zero downtime** in two steps
    SoftAP. **This first OTA writes the other app slot**, putting the device into the
    A/B rotation so `esp_ota_*` rollback tracking is live from here on.
 4. **OTA takes over.** Future updates are fully automatic, signed, and
-   health-gated. Fresh units instead boot to SoftAP `firehouse-setup` and are set
+   health-gated. Fresh units instead boot to SoftAP `tapout-setup` and are set
    up via the form.
 
 ---

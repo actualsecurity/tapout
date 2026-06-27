@@ -1,6 +1,6 @@
 name: firmware
 
-# Build, SIGN, and publish the firehouse-ring-alerter firmware (RAIL A of the
+# Build, SIGN, and publish the tapout firmware (RAIL A of the
 # signed pull-OTA pipeline). The compiled .bin is SECRET-FREE (CHANGE-ME
 # placeholders only) so it is safe to publish from a PUBLIC repo. Authenticity
 # is anchored by the embedded RSA-2048 PUBLIC key in public_key.h; the matching
@@ -12,7 +12,7 @@ name: firmware
 #
 # Owner action required (one time):
 #   1. Generate keys locally (see tools/keygen-instructions.md), commit the
-#      regenerated firehouse_ring_alert/public_key.h, and DO NOT commit the
+#      regenerated tapout/public_key.h, and DO NOT commit the
 #      private key.
 #   2. Add the repo secret  OTA_SIGNING_KEY  = full PEM contents of
 #      private_key.pem  (Settings -> Secrets and variables -> Actions).
@@ -48,8 +48,8 @@ permissions:
 env:
   ESP32_CORE_VERSION: '3.3.10'
   FQBN: 'esp32:esp32:nano_nora'
-  SKETCH_DIR: 'firehouse_ring_alert'
-  SKETCH_NAME: 'firehouse_ring_alert'
+  SKETCH_DIR: 'tapout'
+  SKETCH_NAME: 'tapout'
 
 jobs:
   build-sign-publish:
