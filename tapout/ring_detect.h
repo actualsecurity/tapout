@@ -14,8 +14,13 @@
  * LOW lasting > 25 ms, so every unplug/replug paged everyone.
  *
  * Rules (a "burst" = line activity, merged across idle gaps < 150 ms):
- *   * Arm only after the line has read idle for 3 s continuously (boot).
- *   * Page on a RING PATTERN:
+ *   * Arm only after the line has read idle for 3 s continuously (boot). This
+ *     alone stops the boot/replug pages: the blip happens before arming.
+ *   * RD_MODE_SINGLE (default): page as soon as ONE burst has lasted minMs
+ *     (default 500 ms) -- i.e. on the FIRST ring. Needed because the station
+ *     line may ring only once before the call rolls to county dispatch.
+ *     Shorter activity is a glitch; nothing else is required.
+ *   * RD_MODE_PATTERN (opt-in): page only on a RING PATTERN:
  *       A) two ring-shaped bursts (0.3-3.5 s each), the 2nd starting within
  *          8 s of the 1st ending -- normal US ringing, paged on the 2nd ring; or
  *       B) three or more bursts of >= 0.3 s (any length), each within 8 s of
@@ -23,9 +28,10 @@
  *          past 3.5 s; a single replug can't produce it.
  *   * A single burst of any length never pages (reported as RD_IGNORED);
  *     a burst < 0.3 s is a glitch (RD_GLITCH, counted, never reported).
- * Cost: the page fires on the 2nd ring (~4-6 s after the phone starts ringing)
- * instead of the 1st, and a call abandoned after one ring does not page. The
- * bell is unaffected and stays primary.
+ * Pattern-mode cost: the page fires on the 2nd ring (~4-6 s in) and a call
+ * that rings only once does not page. Single-mode cost: a >= minMs brownout
+ * while the board stays powered (and armed) can still page. The bell is
+ * unaffected and stays primary.
  *
  * ASSUMPTION: the ELK-930 output follows the ring cadence. If it instead held
  * D4 low for the whole call, calls would be reported as RD_IGNORED (one long
@@ -42,6 +48,10 @@
 #define RD_MAX_BURST_MS  3500UL  // longer is not a normal ring (US ~2 s); only counts toward rule B
 #define RD_MAX_GAP_MS    8000UL  // next burst must start within this of the previous ending (US gap ~4 s)
 #define RD_RULE_B_BURSTS    3    // rule B: this many >= 0.3 s bursts in a row
+#define RD_SINGLE_MIN_DEFAULT_MS 500UL   // single mode: page once a burst lasts this long
+
+#define RD_MODE_SINGLE   0       // page on the first ring (default; zero-initialised)
+#define RD_MODE_PATTERN  1       // page only on a 2-ring pattern
 
 typedef enum {
   RD_NONE = 0,
@@ -51,6 +61,8 @@ typedef enum {
 } RdEvent;
 
 typedef struct {
+  uint8_t  mode;                              // RD_MODE_SINGLE (0) | RD_MODE_PATTERN; may change live
+  uint32_t minMs;                             // single mode threshold; 0 = RD_SINGLE_MIN_DEFAULT_MS
   bool     armed;
   bool     idleSeen;  uint32_t idleSince;     // arming: continuous-idle timer
   bool     inBurst;   uint32_t burstStart, lastLow;
@@ -93,6 +105,14 @@ static inline RdEvent ringStep(RingDet* d, bool low, uint32_t now) {
     }
     d->lastLow = now;
     uint32_t len = now - d->burstStart;
+    if (d->mode != RD_MODE_PATTERN) {        // single: the first ring that lasts minMs pages
+      uint32_t need = d->minMs ? d->minMs : RD_SINGLE_MIN_DEFAULT_MS;
+      if (!d->confirmedThisBurst && len >= need) {
+        d->confirmedThisBurst = true;
+        return RD_RING;
+      }
+      return RD_NONE;
+    }
     if (!d->confirmedThisBurst && len >= RD_MIN_BURST_MS && d->run > 0
         && d->burstStart - d->prevEnd <= RD_MAX_GAP_MS
         && (d->prevShaped || d->run + 1 >= RD_RULE_B_BURSTS)) {
@@ -111,6 +131,12 @@ static inline RdEvent ringStep(RingDet* d, bool low, uint32_t now) {
     d->lastBurstStart = d->burstStart;
     d->lastBurstLen = len;
     d->burstsSeen++;
+    if (d->mode != RD_MODE_PATTERN) {        // single: every burst stands alone
+      d->run = 0;                            // (drop any pattern run if the mode just changed)
+      if (d->confirmedThisBurst) return RD_NONE;
+      if (len >= RD_MIN_BURST_MS) { d->ignoredMs = len; d->ignoredBursts = 1; return RD_IGNORED; }
+      return RD_GLITCH;
+    }
     if (len >= RD_MIN_BURST_MS) {
       bool chained = d->run > 0 && d->burstStart - d->prevEnd <= RD_MAX_GAP_MS;
       if (!chained) {

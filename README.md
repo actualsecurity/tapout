@@ -64,33 +64,39 @@ voltage reaches the ESP32.
 These all still work in v2.0.0 and run **before** any of the new code each loop:
 
 - **WiFi connect + non-blocking reconnect** with exponential backoff.
-- **Active-low ring detection that only pages on a real ring pattern** (v2.0.10,
+- **Active-low ring detection that ignores boot/replug blips** (v2.0.10,
   `tapout/ring_detect.h`). D4 is sampled every 5 ms by a dedicated `esp_timer`,
   so blocking network sends in `loop()` can never hide or split a ring.
-  - **Arming:** after boot, the line must read idle for 3 s continuously.
-  - **What pages:**
-    - **(A)** two ring-shaped bursts (0.3–3.5 s each), the second starting
-      within 8 s of the first (US cadence is about 2 s on, 4 s off), or
+  Detection **arms only after the line has read idle for 3 s continuously**, so
+  the D4 blip while the board boots, which is what paged the crew on every
+  power unplug/replug, can never page. Two modes, set by `ring_mode` (NVS,
+  applied live):
+  - **`single` (default):** pages once **one** ring has lasted `ring_min_ms`
+    (default 500 ms, range 100–3000), i.e. on the **first** ring. The station
+    line may ring only once before the call rolls to county dispatch.
+    Shorter blips are ignored.
+    - Trade-off: a power sag of at least `ring_min_ms` while the board stays
+      powered can still page.
+  - **`pattern` (opt-in):** pages only on a ring pattern:
+    - **(A)** two ring-shaped bursts (0.3–3.5 s) within 8 s, or
     - **(B)** three or more bursts of at least 0.3 s, each within 8 s of the
-      previous. This is a fallback in case the detector stretches rings.
-  - **What never pages:** a single burst of any length. That covers the D4
-    blip at boot, a brownout while someone unplugs or replugs the power, and a
-    WiFi-reconnect current spike. It is reported instead as "Line activity
-    ignored (not a ring)" on STATUS (at most one attempt per 10 min) and
-    counted in the heartbeat, the status page and `/status.json`
-    (`ignored_line_activity`). Blips shorter than 0.3 s are only counted
-    (`line_glitches`).
+      previous.
+    - A single burst of any length never pages. The cost is the page fires on
+      the 2nd ring, and a call that rings only once **doesn't page**.
+  - **Setting it:** `curl -u crew:<pass> -d ring_mode=pattern http://<device>/provision`
+    (or `ring_min_ms=800`). From v2.1.0, `tapout ring-mode` does the same.
+  - **Ignored activity** goes to STATUS as "Line activity ignored (not a ring)",
+    at most one attempt per 10 min. It is counted in the heartbeat, the
+    status page and `/status.json` (`ignored_line_activity`,
+    `line_glitches`). The JSON also shows `ring_mode` and `ring_min_ms`.
   - **One alert per call:** "same call or a new one?" is decided from the
-    continuous samples. An 8 s idle re-arm plus a 60 s ceiling mean a slow
-    CALL POST can't cause a duplicate page, and two distinct calls each page.
-  - **Trade-off:** the page fires on the **2nd ring**, about 4–6 s after the
-    phone starts ringing, and a call abandoned after one ring doesn't page.
-    Jiggling the *phone cord* twice within 8 s while the board stays powered
-    can still look like two rings. The bell is unaffected.
+    continuous samples (8 s idle re-arm, 60 s ceiling).
   - **Arming watchdog:** if detection hasn't armed 60 s after boot, STATUS
     gets "Ring detector NOT armed". `/status.json` reports `healthy:false`
     with fault `detector_unarmed`, the dead-man check-in is withheld, and the
     status pill says "Arming".
+  - **No reboot wipes a call:** reboots (`/reboot`, OTA staged, OTA rollback)
+    are held while a real call is confirmed or in flight.
   - **This is the life-safety path. It is never starved, including during a
     firmware download.**
 - **ntfy.sh HTTPS alert** (Pushover template included, commented out).
@@ -492,9 +498,9 @@ alert path, rotate the `ntfy_*` topics via `/provision`.
    confirm a deliberately-unhealthy build auto-rolls-back.
 6. **Tune the cooldown / re-arm** if a single call yields more/fewer alerts than
    wanted.
-7. **Confirm a real call matches the ring pattern.** Place a test call and check
-   that it pages on the 2nd ring and that STATUS shows **no** "Line activity
-   ignored" note. Then compare `recent_bursts` in `/status.json`: each ring
+7. **Confirm a real call is detected.** Place a test call and check that it
+   pages on the first ring in `single` mode (on the 2nd in `pattern` mode) and
+   that STATUS shows **no** "Line activity ignored" note. Then compare `recent_bursts` in `/status.json`: each ring
    should be about 2000 ms long, and consecutive `ago_ms` about 6000 ms apart.
    Do the same after unplugging and replugging the phone cord: it should show
    one burst and an "ignored" note, never a page. The design assumes the

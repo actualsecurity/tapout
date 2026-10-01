@@ -23,9 +23,10 @@
  *
  * Features:
  *   - WiFi connect + non-blocking reconnect with exponential backoff
- *   - ELK-930 active-low ring detection: pages only on a RING PATTERN (2 bursts
- *     of 0.3-3.5 s within 8 s, armed after 3 s idle) -- boot/replug/brownout
- *     blips never page; one alert per call (8 s re-arm, 60 s ceiling)
+ *   - ELK-930 active-low ring detection, sampled every 5 ms off-loop, armed only
+ *     after 3 s of idle line (boot/replug blips never page). ring_mode=single
+ *     (default) pages once a ring lasts ring_min_ms (500 ms) -- the 1st ring;
+ *     ring_mode=pattern pages only on a 2-ring pattern. One alert per call.
  *   - ntfy.sh HTTPS alert (Pushover alternative included, commented out)
  *   - NEVER-LOSE-A-CALL: a ring is latched + retried until delivered (or it
  *     surfaces a delivery-failure on the STATUS topic) so a WiFi/ntfy blip
@@ -146,6 +147,14 @@ static inline uint32_t clampOtaInterval(uint32_t v) {
   return v;
 }
 
+// Single-mode ring threshold bounds: below ~100 ms is glitch territory; above
+// 3 s would miss a ring cut short by a transfer to dispatch.
+static inline uint32_t clampRingMinMs(uint32_t v) {
+  if (v < 100)  return 100;
+  if (v > 3000) return 3000;
+  return v;
+}
+
 // ---- Runtime config struct (populated from NVS "fhacfg" by loadConfig) -------
 static Preferences cfg;                       // NVS namespace "fhacfg"  (<=15 chars)
 struct Cfg {
@@ -154,6 +163,8 @@ struct Cfg {
   String   otaFailedVer;   // version that just failed health probation (skip re-stage)
   bool     otaEnabled;
   uint32_t otaIntervalMin;
+  uint8_t  ringMode;       // RD_MODE_SINGLE (default: page on the 1st ring) | RD_MODE_PATTERN
+  uint32_t ringMinMs;      // single mode: page once a ring has lasted this long
   bool     provisioned;
 } C;
 
@@ -184,6 +195,8 @@ static void loadConfig() {
   // by an older build or a hand-edited namespace, not just the write path.
   C.otaIntervalMin = clampOtaInterval(cfg.getUInt("ota_interval", 360));  // 6 h default
   C.provisioned    = cfg.getBool("provisioned", false);
+  C.ringMode       = cfg.getUChar("ring_mode", RD_MODE_SINGLE) == RD_MODE_PATTERN ? RD_MODE_PATTERN : RD_MODE_SINGLE;
+  C.ringMinMs      = clampRingMinMs(cfg.getUInt("ring_min_ms", RD_SINGLE_MIN_DEFAULT_MS));
   cfg.end();
 }
 
@@ -418,6 +431,7 @@ static void serviceHeapCheck();
 static void serviceIgnoredActivity();
 static void serviceArmCheck();
 static void startRingSampler();
+static void applyRingConfig();
 static bool realCallInFlight();
 static void fireCallAlert(bool simulated);
 static void serviceCallQueue();
@@ -958,6 +972,9 @@ static void handleRoot() {
     row(F("Largest free block"), v);
   }
   row(F("Real CALL alerts delivered (lifetime)"), String((unsigned long)realCallsDelivered));
+  row(F("Ring mode"), C.ringMode == RD_MODE_PATTERN
+      ? String(F("pattern &mdash; pages on the 2nd ring"))
+      : String(F("single &mdash; pages once a ring lasts ")) + C.ringMinMs + F(" ms"));
   row(F("Ignored line activity (not a ring)"),
       String((unsigned long)ignoredActivity) + (ringDet.armed ? F("") : F(" &mdash; detector arming (line must be idle 3 s)")));
   row(F("Boot count"),    String(bootCount));
@@ -1116,6 +1133,8 @@ static void handleStatusJson() {
     const uint32_t now = millis();      // AFTER the copy, so "ago" can't underflow
     server.sendContent(String(F(",\"ring_armed\":")) + (ringDet.armed ? "true" : "false"));
     server.sendContent(String(F(",\"ring_sampler\":\"")) + (ringTimerOk ? "timer" : "loop") + "\"");
+    server.sendContent(String(F(",\"ring_mode\":\"")) + (C.ringMode == RD_MODE_PATTERN ? "pattern" : "single") + "\"");
+    server.sendContent(String(F(",\"ring_min_ms\":")) + String((unsigned long)C.ringMinMs));
     server.sendContent(String(F(",\"ignored_line_activity\":")) + String((unsigned long)ign));
     server.sendContent(String(F(",\"line_glitches\":")) + String((unsigned long)gl));
     server.sendContent(String(F(",\"last_ignored_ms_ago\":")) + String(lastIgn ? (now - lastIgn) : 0));
@@ -1264,9 +1283,18 @@ static void provisionFromArgs() {
   // Clamp to a sane floor/ceiling: toInt() yields 0 for blank/non-numeric input,
   // which would make the loop scheduler run otaCheckManifest() every pass.
   if (server.hasArg("ota_interval")) cfg.putUInt("ota_interval", clampOtaInterval((uint32_t)server.arg("ota_interval").toInt()));
+  if (server.hasArg("ring_mode")) {           // "single" (default) | "pattern"
+    C.ringMode = server.arg("ring_mode") == "pattern" ? RD_MODE_PATTERN : RD_MODE_SINGLE;
+    cfg.putUChar("ring_mode", C.ringMode);
+  }
+  if (server.hasArg("ring_min_ms")) {
+    C.ringMinMs = clampRingMinMs((uint32_t)server.arg("ring_min_ms").toInt());
+    cfg.putUInt("ring_min_ms", C.ringMinMs);
+  }
   cfg.putBool("provisioned", true);
   cfg.end();
   esp_task_wdt_reset();                              // NVS commit can take a few ms
+  applyRingConfig();                                 // ring mode takes effect immediately
 }
 
 // GET / in SETUP MODE -- the SoftAP provisioning form. Password fields render
@@ -1301,6 +1329,8 @@ static void handleSetupForm() {
     "<label>OTA manifest url (optional)</label><input name='ota_manifest' placeholder='https://raw.githubusercontent.com/...'>"
     "<label>Enable auto pull-OTA? (1=yes,0=no)</label><input name='ota_enabled' value='0'>"
     "<label>OTA check interval (minutes)</label><input name='ota_interval' value='360'>"
+    "<label>Ring mode: single = page on the 1st ring (default), pattern = only on a 2-ring pattern</label>"
+    "<input name='ring_mode' value='single'>"
     "<button type='submit'>Save &amp; reboot</button></form>"
     "<p class='sub'>After saving, the device reboots and joins your WiFi.</p>"
     "</div></body></html>"));
@@ -1873,6 +1903,7 @@ void setup() {
 
   // ---- Runtime config from NVS (secrets live here, not in the image) -----
   loadConfig();
+  applyRingConfig();            // ring mode / min length from NVS (before the sampler starts)
 
   // ---- RAIL B: if we just booted a freshly-flashed image, start the 60 s
   //      health-probation clock NOW (committed/rolled-back later in loop). ---
@@ -2084,14 +2115,14 @@ static void serviceWifi() {
 // ---------------------- Ring detection ----------------------------------
 // D4 is sampled every 5 ms by an esp_timer (ringSample), NOT by loop(): loop()
 // blocks for seconds at a time in TLS sends, and sampling there left holes that
-// could hide or split real rings. ring_detect.h decides whether the activity is a
-// RING PATTERN (see the rules there): after the line has read idle 3 s since boot,
-// two ring-shaped bursts within 8 s (or 3+ longer ones). A single burst of any
-// length -- the D4 blip at boot, a brownout while someone unplugs/replugs the
-// power or phone cord, a WiFi-reconnect current spike -- can NEVER page the crew;
-// it is reported on STATUS as ignored activity instead. Trade-off: the page fires
-// on the 2nd ring (~4-6 s in), not the 1st, and a call abandoned after one ring
-// doesn't page. The bell stays primary.
+// could hide or split real rings. ring_detect.h decides what is a ring (see the
+// rules there). Detection arms only after the line has read idle 3 s since boot,
+// so the D4 blip at boot / on a power replug can never page. Then:
+//   ring_mode=single (default): page once ONE ring has lasted ring_min_ms -- the
+//     station line may ring only once before the call rolls to dispatch.
+//   ring_mode=pattern (opt-in): page only on a 2-ring pattern (single blips of
+//     any length can't page; costs the 1st ring).
+// Activity that doesn't page is reported on STATUS as ignored. The bell stays primary.
 //
 // Dedup (one call = one alert) is decided HERE, from continuous samples, so a slow
 // CALL POST can't make the sampler miss the ringing and re-page the same call.
@@ -2136,6 +2167,15 @@ static void ringSample() {
 }
 
 static void ringTimerCb(void*) { ringSample(); }
+
+// Push the configured ring mode / threshold into the detector (live; under the
+// sampler's lock so a mode change can't land mid-step).
+static void applyRingConfig() {
+  portENTER_CRITICAL(&ringMux);
+  ringDet.mode  = C.ringMode;
+  ringDet.minMs = C.ringMinMs;
+  portEXIT_CRITICAL(&ringMux);
+}
 
 // Start the 5 ms sampler. If the timer can't start, loop() samples inline
 // (the pre-2.0.10 behaviour, still pattern-checked) and STATUS says so.

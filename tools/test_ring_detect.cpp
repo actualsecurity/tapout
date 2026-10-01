@@ -13,8 +13,12 @@ static const uint32_t STEP = 5;   // ms between samples (esp_timer period)
 struct Result { int rings = 0; long firstRingMs = -1; int ignored = 0; int glitches = 0; bool armed = false; };
 
 // Run a waveform starting at millis() == t0 (boot), then idle for tailIdleMs.
-static Result run(const Wave& w, uint32_t tailIdleMs = 12000, uint32_t t0 = 0) {
+// Default mode is PATTERN for the original suite; single-mode cases use runS().
+static Result run(const Wave& w, uint32_t tailIdleMs = 12000, uint32_t t0 = 0,
+                  uint8_t mode = RD_MODE_PATTERN, uint32_t minMs = 0) {
   RingDet d = {};
+  d.mode = mode;
+  d.minMs = minMs;
   Result r;
   uint32_t t = t0;
   auto feed = [&](bool low, uint32_t ms) {
@@ -30,6 +34,8 @@ static Result run(const Wave& w, uint32_t tailIdleMs = 12000, uint32_t t0 = 0) {
   r.armed = d.armed;
   return r;
 }
+
+static Result runS(const Wave& w, uint32_t minMs = 0) { return run(w, 12000, 0, RD_MODE_SINGLE, minMs); }
 
 // Chattering burst: the detector output flickering at ~20 Hz for `ms`.
 static void chatter(Wave& w, uint32_t ms) {
@@ -51,6 +57,7 @@ int main() {
     if (!ok) fails++;
   };
 
+  printf("== PATTERN mode (opt-in: page on the 2nd ring) ==\n");
   printf("-- must NEVER page --\n");
   { Result r = run({{true, 40}, {false, 20000}});
     check("boot: D4 low for 40 ms at power-up", r.rings == 0, r); }
@@ -131,6 +138,67 @@ int main() {
     for (int i = 0; i < 240; i++) { w.push_back({false, 2490}); w.push_back({true, 10}); }
     Result r = run(w, 0);
     check("LIMIT: noisy idle (glitch every 2.5 s) never arms (firmware warns)", !r.armed, r); }
+
+  printf("== SINGLE mode (default: page on the 1st ring) ==\n");
+  { RingDet d = {};
+    Result r; r.rings = d.mode == RD_MODE_SINGLE;
+    check("zero-initialised detector defaults to SINGLE mode", d.mode == RD_MODE_SINGLE, r); }
+  printf("-- must NEVER page --\n");
+  { Result r = runS({{true, 40}, {false, 20000}});
+    check("single: boot, D4 low for 40 ms at power-up", r.rings == 0, r); }
+  { Result r = runS({{true, 2000}, {false, 20000}});
+    check("single: boot, D4 low for 2 s at power-up", r.rings == 0, r); }
+  { Result r = runS({{false, 200}, {true, 2000}, {false, 20000}});
+    check("single: boot, idle 200 ms then a 2 s low (not armed yet)", r.rings == 0, r); }
+  { int total = 0;
+    for (int i = 0; i < 3; i++) total += runS({{true, 1500}, {false, 1000}, {true, 500}, {false, 15000}}).rings;
+    Result r; r.rings = total;
+    check("single: 3x power replug (1.5 s low, 1 s idle, 0.5 s low at boot)", total == 0, r); }
+  { Result r = runS({{true, 10000}, {false, 20000}});
+    check("single: boot with line held low 10 s, then idle", r.rings == 0, r); }
+  { Result r = runS({{false, 5000}, {true, 8}, {false, 20000}});
+    check("single: armed 8 ms glitch", r.rings == 0 && r.glitches == 1, r); }
+  { Result r = runS({{false, 5000}, {true, 400}, {false, 20000}});
+    check("single: armed 0.4 s blip (under 0.5 s min) -> ignored", r.rings == 0 && r.ignored == 1, r); }
+  { Wave w{{false, 5000}};
+    for (int i = 0; i < 6; i++) { w.push_back({true, 120}); w.push_back({false, 1500}); }
+    Result r = runS(w);
+    check("single: six 120 ms plug/unplug glitches", r.rings == 0, r); }
+  { Result r = runS({{false, 5000}, {true, 1000}, {false, 20000}}, 1500);
+    check("single, min 1.5 s: a 1.0 s blip -> ignored", r.rings == 0 && r.ignored == 1, r); }
+  printf("-- real calls MUST page (on the FIRST ring) --\n");
+  { Result r = runS(ring(1));
+    check("single: ONE ring, then the call rolls to dispatch", r.rings == 1 && r.firstRingMs == 5000 + 500, r); }
+  { Result r = runS({{false, 5000}, {true, 900}, {false, 20000}});
+    check("single: transferred mid-ring (0.9 s of ringing)", r.rings == 1, r); }
+  { Result r = runS(ring(4));
+    check("single: US ring x4 -> pages at 0.5 s into ring 1", r.rings >= 1 && r.firstRingMs == 5000 + 500, r); }
+  { Wave w{{false, 5000}};
+    chatter(w, 2000); w.push_back({false, 4000});
+    Result r = runS(w);
+    check("single: one ring with 20 Hz chatter", r.rings == 1, r); }
+  { Result r = runS({{true, 30}, {false, 3200}, {true, 2000}, {false, 4000}});
+    check("single: one ring 3.2 s after boot (armed at 3 s)", r.rings == 1, r); }
+  { Result r = runS({{false, 5000}, {true, 2000}, {false, 20000}}, 1500);
+    check("single, min 1.5 s: a 2 s ring -> page", r.rings == 1 && r.firstRingMs == 5000 + 1500, r); }
+  { Result r = run(ring(4), 12000, 0xFFFFFFFFu - 9000, RD_MODE_SINGLE);
+    check("single: across the millis() 2^32 wraparound", r.rings >= 1 && r.firstRingMs == 5000 + 500, r); }
+  printf("-- documented limitations --\n");
+  { Result r = runS({{false, 5000}, {true, 2000}, {false, 20000}});
+    check("LIMIT single: a 2 s brownout while powered + armed -> pages", r.rings == 1, r); }
+  { Wave w;
+    for (int i = 0; i < 240; i++) { w.push_back({false, 2490}); w.push_back({true, 10}); }
+    Result r = run(w, 0, 0, RD_MODE_SINGLE);
+    check("LIMIT single: noisy idle never arms (firmware warns)", !r.armed, r); }
+  printf("-- switching modes live --\n");
+  { RingDet d = {}; d.mode = RD_MODE_PATTERN; uint32_t t = 0; int rings = 0;
+    for (; t < 5000; t += STEP) ringStep(&d, false, t);
+    for (uint32_t e = 0; e < 2000; e += STEP, t += STEP) rings += ringStep(&d, true, t) == RD_RING;   // ring 1 (pattern: no page)
+    d.mode = RD_MODE_SINGLE;                                                                    // switched mid-gap
+    for (uint32_t e = 0; e < 4000; e += STEP, t += STEP) ringStep(&d, false, t);
+    for (uint32_t e = 0; e < 2000; e += STEP, t += STEP) rings += ringStep(&d, true, t) == RD_RING;   // ring 2: single pages
+    Result r; r.rings = rings;
+    check("pattern -> single switch mid-call: next ring pages once", rings == 1, r); }
 
   printf("%s\n", fails ? "SOME TESTS FAILED" : "all ring-detector tests passed");
   return fails ? 1 : 0;
