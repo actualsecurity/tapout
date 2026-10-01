@@ -23,7 +23,9 @@
  *
  * Features:
  *   - WiFi connect + non-blocking reconnect with exponential backoff
- *   - ELK-930 active-low ring detection (25 ms debounce, 60 s cooldown)
+ *   - ELK-930 active-low ring detection: pages only on a RING PATTERN (2 bursts
+ *     of 0.3-3.5 s within 8 s, armed after 3 s idle) -- boot/replug/brownout
+ *     blips never page; one alert per call (8 s re-arm, 60 s ceiling)
  *   - ntfy.sh HTTPS alert (Pushover alternative included, commented out)
  *   - NEVER-LOSE-A-CALL: a ring is latched + retried until delivered (or it
  *     surfaces a delivery-failure on the STATUS topic) so a WiFi/ntfy blip
@@ -90,7 +92,9 @@
 #include <mbedtls/md.h>     // MBEDTLS_MD_SHA256
 #include <esp_ota_ops.h>    // esp_ota_* A/B partition + rollback (RAIL B)
 #include <DNSServer.h>      // captive-portal DNS for the SoftAP setup mode
+#include <esp_timer.h>      // 5 ms D4 sampler, independent of loop() (ring detection)
 #include "public_key.h"     // RSA-2048 signing public key (RAIL A) -- committed, not secret
+#include "ring_detect.h"    // ring-PATTERN detector (rejects boot/replug/brownout blips)
 
 // ======================= USER CONFIG -- SECRET-FREE DEFAULTS =============
 // v2.0.0: ALL secrets now live in NVS namespace "fhacfg" (Preferences), written
@@ -193,7 +197,8 @@ static bool isProvisioned() {
 static const int RING_PIN = D4;   // ELK-930 open-collector output (active LOW)
 
 // --------------------------- Tunables -----------------------------------
-static const uint32_t DEBOUNCE_MS         = 25;             // confirm ring is real
+// (Ring qualification -- arm delay, burst length, 2-burst pattern -- lives in
+//  ring_detect.h; see RD_* there.)
 static const uint32_t COOLDOWN_MS         = 60UL * 1000UL;  // absolute re-alert ceiling
 // Re-arm for a NEW call once the line has been idle (HIGH) at least this long --
 // longer than the within-call inter-ring silence (US cadence ~4 s off). This lets
@@ -244,14 +249,39 @@ static const uint8_t  RINGLOG_N         = 20;          // events kept on flash
 static const uint8_t  RINGLOG_VERSION   = 2;           // bump if blob layout changes (v2 adds simMask)
 
 // Web identity / build stamp.
-static const char* FW_VERSION    = "2.0.9";
+static const char* FW_VERSION    = "2.0.10";
 static const char* FW_BUILD_MARK = __DATE__ " " __TIME__;
 
 // --------------------------- State --------------------------------------
 static uint32_t lastAlertMs      = 0;
-static uint32_t lastRingActiveMs = 0;       // millis() the line was last seen LOW
+static volatile uint32_t lastRingActiveMs = 0;  // millis() the line was last active (>= 30 ms); written by the ring sampler
 static bool     everAlerted      = false;
-static bool     ringArmed        = false;   // false until D4 first reads idle (HIGH); blocks boot-transient / stuck-line / no-line false pages
+// ---- Ring detection state. ringSample() (the 5 ms esp_timer) owns everything
+// below; loop() only reads it under ringMux or consumes the *Pending counters.
+static RingDet      ringDet          = {};  // ring-pattern detector (ring_detect.h)
+static portMUX_TYPE ringMux          = portMUX_INITIALIZER_UNLOCKED;
+static esp_timer_handle_t ringTimer  = nullptr;
+static bool         ringTimerOk      = false;   // false => loop() samples inline (fallback)
+static bool         idleSinceAlert   = true;    // line idle >= RING_REARM_IDLE_MS since the last page (=> next pattern is a NEW call)
+static uint32_t     ringPagesPending = 0;       // confirmed NEW calls not yet handed to the alert pipeline
+static uint32_t     ringPageAtMs     = 0;       // millis() the newest one was confirmed
+static uint32_t     ringDetectedAtMs = 0;       // ...as handed to triggerRingPipeline() (message age)
+// Line activity that did NOT form a ring pattern (boot blip, power/cord replug,
+// brownout...). Never pages; surfaced on STATUS (throttled), heartbeat and JSON.
+static const uint32_t IGNORED_PING_MS = 10UL * 60UL * 1000UL;
+static uint32_t     ignoredActivity    = 0;     // runs of >= 0.3 s activity that weren't a ring (since boot)
+static uint32_t     glitchCount        = 0;     // isolated < 0.3 s blips (since boot; counted only)
+static uint32_t     ignoredPending     = 0;
+static uint32_t     lastIgnoredMs      = 0;
+static uint32_t     lastIgnoredLenMs   = 0;
+static uint32_t     lastIgnoredBursts  = 0;
+static uint32_t     lastIgnoredPingMs  = 0;
+static bool         ignoredPingPending = false;
+// Last few bursts (>= 30 ms) for field validation of real D4 timing in /status.json.
+struct BurstRec { uint32_t startMs, lenMs; };
+static const uint8_t BURSTLOG_N = 8;
+static BurstRec     burstLog[BURSTLOG_N];
+static uint8_t      burstLogHead = 0, burstLogCount = 0;
 static uint32_t lastHeartbeatMs  = 0;
 static uint32_t wifiBackoffMs    = WIFI_BACKOFF_MIN_MS;
 static uint32_t lastWifiAttempt  = 0;
@@ -385,6 +415,9 @@ static void announceOnlineOnce();
 static void serviceStuckLine();
 static void serviceCredWarn();
 static void serviceHeapCheck();
+static void serviceIgnoredActivity();
+static void serviceArmCheck();
+static void startRingSampler();
 static void fireCallAlert(bool simulated);
 static void serviceCallQueue();
 static void triggerRingPipeline(bool simulated);
@@ -892,6 +925,7 @@ static void handleRoot() {
   server.sendContent(F("<div class='card'>"));
   if (!wifiUp)                            server.sendContent(F("<span class='pill bad'>WiFi DOWN</span>"));
   else if (digitalRead(RING_PIN) == LOW) server.sendContent(F("<span class='pill bad'>RINGING NOW</span>"));
+  else if (!ringDet.armed)               server.sendContent(F("<span class='pill warn'>Arming -- waiting for 3 s of idle line</span>"));
   else                                   server.sendContent(F("<span class='pill ok'>Idle -- armed</span>"));
   if (callPending)                       server.sendContent(F(" <span class='pill warn'>CALL alert retrying</span>"));
   if (!timeSynced())                     server.sendContent(F(" <span class='pill warn'>NTP not synced</span>"));
@@ -923,6 +957,8 @@ static void handleRoot() {
     row(F("Largest free block"), v);
   }
   row(F("Real CALL alerts delivered (lifetime)"), String((unsigned long)realCallsDelivered));
+  row(F("Ignored line activity (not a ring)"),
+      String((unsigned long)ignoredActivity) + (ringDet.armed ? F("") : F(" &mdash; detector arming (line must be idle 3 s)")));
   row(F("Boot count"),    String(bootCount));
   row(F("Last reset"),    String(gResetReason));
   {
@@ -1025,7 +1061,7 @@ static void handleStatusJson() {
 
   // Single machine-checkable verdict + fault list. An external monitor can alarm
   // on healthy==false OR on this page going unreachable.
-  bool healthy = wifiUp && timeSynced() && !frag && !lowHeapWarned && !detectorStuck;
+  bool healthy = wifiUp && timeSynced() && !frag && !lowHeapWarned && !detectorStuck && ringDet.armed;
   server.sendContent(String(F(",\"healthy\":")) + (healthy ? "true" : "false"));
   server.sendContent(F(",\"faults\":["));
   {
@@ -1041,6 +1077,7 @@ static void handleStatusJson() {
     if (lowHeapWarned)  fault("low_heap");
     if (detectorStuck)  fault("detector_stuck");
     if (g_onProbation)  fault("ota_probation");
+    if (!ringDet.armed) fault("detector_unarmed");
   }
   server.sendContent(F("]"));
 
@@ -1066,6 +1103,32 @@ static void handleStatusJson() {
       server.sendContent(String(F(",\"running_image_version\":\"")) + desc.version + "\"");
     else
       server.sendContent(F(",\"running_image_version\":\"\""));
+  }
+
+  // Ring-pattern detector: armed yet? how much non-ring activity was ignored?
+  {
+    uint32_t ign, gl, lastIgn, lastLen; BurstRec bl[BURSTLOG_N]; uint8_t bc, bh;
+    portENTER_CRITICAL(&ringMux);
+    ign = ignoredActivity; gl = glitchCount; lastIgn = lastIgnoredMs; lastLen = lastIgnoredLenMs;
+    memcpy(bl, burstLog, sizeof(bl)); bc = burstLogCount; bh = burstLogHead;
+    portEXIT_CRITICAL(&ringMux);
+    server.sendContent(String(F(",\"ring_armed\":")) + (ringDet.armed ? "true" : "false"));
+    server.sendContent(String(F(",\"ring_sampler\":\"")) + (ringTimerOk ? "timer" : "loop") + "\"");
+    server.sendContent(String(F(",\"ignored_line_activity\":")) + String((unsigned long)ign));
+    server.sendContent(String(F(",\"line_glitches\":")) + String((unsigned long)gl));
+    server.sendContent(String(F(",\"last_ignored_ms_ago\":")) + String(lastIgn ? (now - lastIgn) : 0));
+    server.sendContent(String(F(",\"last_ignored_longest_ms\":")) + String((unsigned long)lastLen));
+    // Newest first: how long ago each burst (>= 30 ms) started and how long it
+    // lasted -- gaps follow from consecutive ago_ms. For checking real-call and
+    // real-replug timing in the field.
+    server.sendContent(F(",\"recent_bursts\":["));
+    for (uint8_t i = 0; i < bc; i++) {
+      const BurstRec& b = bl[(bh + BURSTLOG_N - 1 - i) % BURSTLOG_N];
+      if (i) server.sendContent(F(","));
+      server.sendContent(String(F("{\"ago_ms\":")) + String((unsigned long)(now - b.startMs))
+                         + F(",\"len_ms\":") + String((unsigned long)b.lenMs) + F("}"));
+    }
+    server.sendContent(F("]"));
   }
 
   // ring_log streamed per-event (no large String). MUST be the last field.
@@ -1379,7 +1442,8 @@ static bool otaEnabledAndSafe() {
 static bool otaSafeToStart() {
   if (callPending) return false;                                       // a call is latched/in-flight
   if (digitalRead(RING_PIN) == LOW) return false;                      // line active right now
-  if (millis() - lastRingActiveMs < RING_REARM_IDLE_MS) return false;  // just rang
+  { uint32_t act = lastRingActiveMs;   // read BEFORE millis(): the 5 ms sampler may update it concurrently
+    if (millis() - act < RING_REARM_IDLE_MS) return false; }           // just rang
   if (WiFi.status() != WL_CONNECTED) return false;
   if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < TLS_MIN_CONTIG_BLOCK) return false;
   const esp_partition_t* run = esp_ota_get_running_partition();
@@ -1635,7 +1699,8 @@ static void handleCheckOta() {
   bool keyReal     = !looksLikePlaceholder((const char*)PUBLIC_KEY) && PUBLIC_KEY_LEN > 64;
   bool callP       = callPending;
   bool ringActive  = (digitalRead(RING_PIN) == LOW);
-  bool justRang    = (millis() - lastRingActiveMs < RING_REARM_IDLE_MS);
+  uint32_t lastAct = lastRingActiveMs;  // read before millis() (sampler writes it concurrently)
+  bool justRang    = (millis() - lastAct < RING_REARM_IDLE_MS);
   bool wifi        = (WiFi.status() == WL_CONNECTED);
   bool heapOk      = (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= TLS_MIN_CONTIG_BLOCK);
   const esp_partition_t* run = esp_ota_get_running_partition();
@@ -1815,6 +1880,7 @@ void setup() {
   // Ring input: idle HIGH, ELK-930 pulls LOW during a ring.
   pinMode(RING_PIN, INPUT_PULLUP);
   delay(50);   // let the internal pull-up settle before any read (avoids a transient-LOW false alarm)
+  startRingSampler();           // 5 ms D4 sampler (arms after 3 s idle; see ring_detect.h)
   // No boot-time D4 read here: serviceStuckLine() monitors continuously and only
   // warns if the line stays active past LINE_STUCK_MS, so a brief startup transient
   // never false-fires and a genuinely stuck line is caught at boot OR any time after.
@@ -1939,6 +2005,8 @@ void loop() {
   serviceStuckLine();           // continuous detector "stuck active" monitor
   serviceCredWarn();            // one-shot default-password warning
   serviceHeapCheck();           // low-heap canary (throttled)
+  serviceIgnoredActivity();     // STATUS note for non-ring line activity (throttled)
+  serviceArmCheck();            // STATUS warning if ring detection never armed
   serviceDeadman();             // external check-in, withheld when degraded (opt-in)
   server.handleClient();        // serve status page / json / actions (fast)
 
@@ -2005,39 +2073,139 @@ static void serviceWifi() {
 }
 
 // ---------------------- Ring detection ----------------------------------
+// D4 is sampled every 5 ms by an esp_timer (ringSample), NOT by loop(): loop()
+// blocks for seconds at a time in TLS sends, and sampling there left holes that
+// could hide or split real rings. ring_detect.h decides whether the activity is a
+// RING PATTERN (see the rules there): after the line has read idle 3 s since boot,
+// two ring-shaped bursts within 8 s (or 3+ longer ones). A single burst of any
+// length -- the D4 blip at boot, a brownout while someone unplugs/replugs the
+// power or phone cord, a WiFi-reconnect current spike -- can NEVER page the crew;
+// it is reported on STATUS as ignored activity instead. Trade-off: the page fires
+// on the 2nd ring (~4-6 s in), not the 1st, and a call abandoned after one ring
+// doesn't page. The bell stays primary.
+//
+// Dedup (one call = one alert) is decided HERE, from continuous samples, so a slow
+// CALL POST can't make the sampler miss the ringing and re-page the same call.
+static void ringSample() {
+  const bool low = (digitalRead(RING_PIN) == LOW);
+  const uint32_t now = millis();
+  portENTER_CRITICAL(&ringMux);
+  const uint32_t burstsBefore = ringDet.burstsSeen;
+  RdEvent ev = ringStep(&ringDet, low, now);
+
+  // "Line active" for OTA gating + call dedup: >= 30 ms of activity (a lone 5 ms
+  // glitch on a noisy line shouldn't hold off OTA or re-arming forever).
+  if (low && ringDet.armed && ringDet.inBurst && now - ringDet.burstStart >= 30) lastRingActiveMs = now;
+  if (!low && now - lastRingActiveMs >= RING_REARM_IDLE_MS) idleSinceAlert = true;
+
+  if (ringDet.burstsSeen != burstsBefore && ringDet.lastBurstLen >= 30) {
+    burstLog[burstLogHead] = { ringDet.lastBurstStart, ringDet.lastBurstLen };
+    burstLogHead = (burstLogHead + 1) % BURSTLOG_N;
+    if (burstLogCount < BURSTLOG_N) burstLogCount++;
+  }
+
+  if (ev == RD_RING) {
+    // COOLDOWN_MS remains an absolute ceiling so a line that keeps ringing re-alerts.
+    bool newCall = !everAlerted || idleSinceAlert || (now - lastAlertMs >= COOLDOWN_MS);
+    if (newCall) {
+      lastAlertMs    = now;
+      everAlerted    = true;
+      idleSinceAlert = false;
+      ringPagesPending++;
+      ringPageAtMs   = now;
+    }
+  } else if (ev == RD_IGNORED) {
+    ignoredActivity++;
+    ignoredPending++;
+    lastIgnoredMs     = now;
+    lastIgnoredLenMs  = ringDet.ignoredMs;
+    lastIgnoredBursts = ringDet.ignoredBursts;
+  } else if (ev == RD_GLITCH) {
+    glitchCount++;
+  }
+  portEXIT_CRITICAL(&ringMux);
+}
+
+static void ringTimerCb(void*) { ringSample(); }
+
+// Start the 5 ms sampler. If the timer can't start, loop() samples inline
+// (the pre-2.0.10 behaviour, still pattern-checked) and STATUS says so.
+static void startRingSampler() {
+  const esp_timer_create_args_t args = {
+    .callback = ringTimerCb,
+    .arg = nullptr,
+    .dispatch_method = ESP_TIMER_TASK,
+    .name = "ring",
+    .skip_unhandled_events = true,
+  };
+  ringTimerOk = esp_timer_create(&args, &ringTimer) == ESP_OK
+             && esp_timer_start_periodic(ringTimer, 5000) == ESP_OK;
+  Serial.println(ringTimerOk ? F("[ring] 5 ms sampler running")
+                             : F("[ring] sampler timer FAILED -- sampling from loop()"));
+}
+
+// loop()-side: hand confirmed calls to the alert pipeline. Cheap; call it often
+// (loop, OTA download pump, setup portal).
 static void handleRing() {
-  if (digitalRead(RING_PIN) != LOW) { ringArmed = true; return; }   // idle HIGH -> arm + nothing to do
+  if (!ringTimerOk) ringSample();
+  uint32_t pages, at, ign;
+  portENTER_CRITICAL(&ringMux);
+  pages = ringPagesPending; ringPagesPending = 0;
+  at    = ringPageAtMs;
+  ign   = ignoredPending;   ignoredPending   = 0;
+  portEXIT_CRITICAL(&ringMux);
 
-  // Do NOT trust a LOW until the line has been seen idle (HIGH) at least once
-  // since boot. This rejects the brief boot-time D4 transient, a stuck line, and
-  // an unconnected detector -- none of them can ever false-page the crew. Once a
-  // genuine idle has been observed, normal ring detection arms.
-  if (!ringArmed) return;
+  if (ign) {
+    ignoredPingPending = true;
+    Serial.println(F("[ring] ignored line activity (not a ring pattern)"));
+  }
+  if (pages) {
+    ringDetectedAtMs = at;
+    triggerRingPipeline(/*simulated=*/false);
+  }
+}
 
-  // Debounce: confirm the line is still pulled low.
-  delay(DEBOUNCE_MS);
-  esp_task_wdt_reset();
-  if (digitalRead(RING_PIN) != LOW) return;   // glitch, ignore
+// STATUS note (at most one ATTEMPT per IGNORED_PING_MS -- throttled on attempts,
+// not successes, so an ntfy outage can't turn it into a send-every-loop storm)
+// when line activity was ignored: a replug/brownout is visible without paging
+// anyone, and a real call that somehow didn't match the pattern shows up too.
+static void serviceIgnoredActivity() {
+  if (!ignoredPingPending || WiFi.status() != WL_CONNECTED || callPending) return;
+  if (lastIgnoredPingMs && millis() - lastIgnoredPingMs < IGNORED_PING_MS) return;
+  lastIgnoredPingMs  = millis();
+  ignoredPingPending = false;
+  uint32_t lenMs, bursts, count, agoS;
+  portENTER_CRITICAL(&ringMux);
+  lenMs = lastIgnoredLenMs; bursts = lastIgnoredBursts; count = ignoredActivity;
+  agoS = (millis() - lastIgnoredMs) / 1000;
+  portEXIT_CRITICAL(&ringMux);
+  char msg[360];
+  snprintf(msg, sizeof(msg),
+    "%lus ago the detector line was active (%lu burst%s, longest %lu.%lu s) without a ring "
+    "pattern, so the crew was NOT paged. Usually a power/phone-cord replug or a brownout. "
+    "If the station phone really rang then, report it: the detector may need tuning. "
+    "Ignored since boot: %lu.",
+    (unsigned long)agoS, (unsigned long)bursts, bursts == 1 ? "" : "s",
+    (unsigned long)(lenMs / 1000), (unsigned long)((lenMs % 1000) / 100), (unsigned long)count);
+  sendNtfy(C.ntfyStatus.c_str(), "Line activity ignored (not a ring)", msg, "default", "shield");
+}
 
-  uint32_t now = millis();
-  uint32_t idleGap = now - lastRingActiveMs;   // how long the line was idle (HIGH)
-  lastRingActiveMs = now;                       // the line is active right now
-
-  // One call = one alert: WITHIN a call the line only goes HIGH for the short
-  // inter-ring silence (US cadence ~4 s), so those pulses fall under
-  // RING_REARM_IDLE_MS and do not re-page. A genuinely NEW call arrives after a
-  // longer idle gap and DOES page -- even just seconds after the previous one,
-  // which the old flat 60 s blackout silently dropped. COOLDOWN_MS remains an
-  // absolute ceiling so a line stuck ringing eventually re-alerts.
-  bool newCall = !everAlerted
-              || (idleGap >= RING_REARM_IDLE_MS)
-              || (now - lastAlertMs >= COOLDOWN_MS);
-  if (!newCall) return;                          // same call's cadence -> already paged
-
-  // A REAL ring updates the dedup/cooldown state, THEN runs the shared pipeline.
-  lastAlertMs = now;
-  everAlerted = true;
-  triggerRingPipeline(/*simulated=*/false);
+// Loud STATUS warning if detection hasn't armed a minute after boot (the line
+// never read idle for 3 s straight): until it arms, a real call would NOT page.
+// Attempt-throttled; re-arms the warning if it ever disarms again (it doesn't today).
+static void serviceArmCheck() {
+  static uint32_t lastTryMs = 0;
+  static bool     warned    = false;
+  if (ringDet.armed) { warned = false; return; }
+  if (warned || millis() < 60000 || WiFi.status() != WL_CONNECTED) return;
+  if (lastTryMs && millis() - lastTryMs < 30UL * 60UL * 1000UL) return;
+  lastTryMs = millis();
+  if (sendNtfy(C.ntfyStatus.c_str(), "Ring detector NOT armed",
+        "The detector line has not read idle for 3 s straight since boot, so ring detection "
+        "is not armed and a call would NOT page. Check the ELK-930 and the phone cord. "
+        "(The bell is unaffected.)", "high", "warning")) {
+    warned = true;
+  }
 }
 
 // Shared post-debounce pipeline for BOTH a real ring (handleRing) and the
@@ -2045,7 +2213,7 @@ static void handleRing() {
 // it proves the genuine record->latch->alert chain, not a parallel copy.
 //
 // CRITICAL dedup safety: the simulated path must NOT touch lastAlertMs,
-// everAlerted, or lastRingActiveMs (those stay in handleRing's real branch),
+// everAlerted, or lastRingActiveMs (those stay in ringSample's real branch),
 // so a test can never suppress a subsequent REAL ring via cooldown/re-arm.
 static void triggerRingPipeline(bool simulated) {
   uint32_t now = millis();
@@ -2061,7 +2229,7 @@ static void triggerRingPipeline(bool simulated) {
   // so a WiFi/ntfy blip can never silently drop a real call.
   callPending    = true;
   callSimulated  = simulated;
-  callDetectedMs = now;
+  callDetectedMs = simulated ? now : ringDetectedAtMs;   // real: when the pattern was confirmed
   callAttempts   = 0;
   lastCallTryMs  = now;
   fireCallAlert(simulated);
@@ -2079,8 +2247,8 @@ static void handleHeartbeat() {
   char msg[256];
   snprintf(msg, sizeof(msg),
            "Ring detector still online (hourly check-in, seq %lu). %s. Rings since "
-           "boot: %lu. Free heap %u B, largest block %u B.",
-           (unsigned long)heartbeatSeq, ts, (unsigned long)ringCount,
+           "boot: %lu (ignored non-ring line activity: %lu). Free heap %u B, largest block %u B.",
+           (unsigned long)heartbeatSeq, ts, (unsigned long)ringCount, (unsigned long)ignoredActivity,
            (unsigned)ESP.getFreeHeap(), (unsigned)largest);
   sendNtfy(C.ntfyStatus.c_str(), "Tapout heartbeat",
            msg, "min", "green_heart");
@@ -2167,7 +2335,8 @@ static void serviceDeadman() {
   // Gate on real HEALTH, not merely "the loop is running".
   bool healthy = (WiFi.status() == WL_CONNECTED)
               && (digitalRead(RING_PIN) == HIGH)     // detector not stuck active
-              && (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= TLS_MIN_CONTIG_BLOCK);
+              && (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= TLS_MIN_CONTIG_BLOCK)
+              && ringDet.armed;                      // unarmed => a call would not page
   if (!healthy) return;   // withhold the check-in -> external monitor pages on silence
 
   bool ok = httpGetBounded(C.deadman.c_str());

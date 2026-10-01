@@ -64,10 +64,35 @@ voltage reaches the ESP32.
 These all still work in v2.0.0 and run **before** any of the new code each loop:
 
 - **WiFi connect + non-blocking reconnect** with exponential backoff.
-- **Active-low ring detection** — 25 ms debounce, 60 s cooldown ceiling, and an
-  8 s idle re-arm so one call's ring cadence collapses to a single alert while
-  two genuinely distinct calls each page. **This is the life-safety path and runs
-  first every loop — never starved, including during a firmware download.**
+- **Active-low ring detection that only pages on a real ring pattern** (v2.0.10,
+  `tapout/ring_detect.h`). D4 is sampled every 5 ms by a dedicated `esp_timer`,
+  so blocking network sends in `loop()` can never hide or split a ring.
+  - **Arming:** after boot, the line must read idle for 3 s continuously.
+  - **What pages:**
+    - **(A)** two ring-shaped bursts (0.3–3.5 s each), the second starting
+      within 8 s of the first (US cadence is about 2 s on, 4 s off), or
+    - **(B)** three or more bursts of at least 0.3 s, each within 8 s of the
+      previous. This is a fallback in case the detector stretches rings.
+  - **What never pages:** a single burst of any length. That covers the D4
+    blip at boot, a brownout while someone unplugs or replugs the power, and a
+    WiFi-reconnect current spike. It is reported instead as "Line activity
+    ignored (not a ring)" on STATUS (at most one attempt per 10 min) and
+    counted in the heartbeat, the status page and `/status.json`
+    (`ignored_line_activity`). Blips shorter than 0.3 s are only counted
+    (`line_glitches`).
+  - **One alert per call:** "same call or a new one?" is decided from the
+    continuous samples. An 8 s idle re-arm plus a 60 s ceiling mean a slow
+    CALL POST can't cause a duplicate page, and two distinct calls each page.
+  - **Trade-off:** the page fires on the **2nd ring**, about 4–6 s after the
+    phone starts ringing, and a call abandoned after one ring doesn't page.
+    Jiggling the *phone cord* twice within 8 s while the board stays powered
+    can still look like two rings. The bell is unaffected.
+  - **Arming watchdog:** if detection hasn't armed 60 s after boot, STATUS
+    gets "Ring detector NOT armed". `/status.json` reports `healthy:false`
+    with fault `detector_unarmed`, the dead-man check-in is withheld, and the
+    status pill says "Arming".
+  - **This is the life-safety path. It is never starved, including during a
+    firmware download.**
 - **ntfy.sh HTTPS alert** (Pushover template included, commented out).
 - **Never-lose-a-call retry latch** — a detected ring is latched and retried
   until delivered; if delivery ultimately fails it surfaces a failure notice on
@@ -467,6 +492,16 @@ alert path, rotate the `ntfy_*` topics via `/provision`.
    confirm a deliberately-unhealthy build auto-rolls-back.
 6. **Tune the cooldown / re-arm** if a single call yields more/fewer alerts than
    wanted.
+7. **Confirm a real call matches the ring pattern.** Place a test call and check
+   that it pages on the 2nd ring and that STATUS shows **no** "Line activity
+   ignored" note. Then compare `recent_bursts` in `/status.json`: each ring
+   should be about 2000 ms long, and consecutive `ago_ms` about 6000 ms apart.
+   Do the same after unplugging and replugging the phone cord: it should show
+   one burst and an "ignored" note, never a page. The design assumes the
+   ELK-930 output *follows the ring cadence*. If it held D4 low for the whole
+   call, calls would show up as one long ignored burst instead of paging.
+   `tools/test_ring_detect.cpp` replays 30 simulated waveforms on the host:
+   `c++ -std=c++17 -o /tmp/trd tools/test_ring_detect.cpp && /tmp/trd`.
 
 ## Reliability hardening
 
