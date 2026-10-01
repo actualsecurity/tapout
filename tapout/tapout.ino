@@ -418,6 +418,7 @@ static void serviceHeapCheck();
 static void serviceIgnoredActivity();
 static void serviceArmCheck();
 static void startRingSampler();
+static bool realCallInFlight();
 static void fireCallAlert(bool simulated);
 static void serviceCallQueue();
 static void triggerRingPipeline(bool simulated);
@@ -1112,6 +1113,7 @@ static void handleStatusJson() {
     ign = ignoredActivity; gl = glitchCount; lastIgn = lastIgnoredMs; lastLen = lastIgnoredLenMs;
     memcpy(bl, burstLog, sizeof(bl)); bc = burstLogCount; bh = burstLogHead;
     portEXIT_CRITICAL(&ringMux);
+    const uint32_t now = millis();      // AFTER the copy, so "ago" can't underflow
     server.sendContent(String(F(",\"ring_armed\":")) + (ringDet.armed ? "true" : "false"));
     server.sendContent(String(F(",\"ring_sampler\":\"")) + (ringTimerOk ? "timer" : "loop") + "\"");
     server.sendContent(String(F(",\"ignored_line_activity\":")) + String((unsigned long)ign));
@@ -1440,6 +1442,7 @@ static bool otaEnabledAndSafe() {
 // passes from the first boot onward while still refusing to update from an
 // UNDEFINED/PENDING image that could not serve as a fallback.
 static bool otaSafeToStart() {
+  if (otaState != PULL_OTA_IDLE) return false;                         // already staged, waiting to reboot
   if (callPending) return false;                                       // a call is latched/in-flight
   if (digitalRead(RING_PIN) == LOW) return false;                      // line active right now
   { uint32_t act = lastRingActiveMs;   // read BEFORE millis(): the 5 ms sampler may update it concurrently
@@ -1607,9 +1610,10 @@ static bool otaDownloadAndFlash(const String& url, size_t totalSize /* firmware 
             "standby slot. Rebooting into a 60s health trial...").c_str(),
            "default", "arrows_counterclockwise");
   Serial.println(F("[ota] staged + verified -- rebooting into trial"));
-  delay(500);
-  ESP.restart();
-  return true;                   // not reached
+  // Reboot via loop()'s deferred-reboot handler, which holds while a real call is
+  // confirmed/in flight (a direct ESP.restart() here would wipe it).
+  pendingRebootMs = millis() + 500;
+  return true;
 }
 
 // Fetch the manifest, gate on semver + min_supported, then download+flash.
@@ -1826,6 +1830,10 @@ static void otaServiceProbation() {
   }
 
   if ((int32_t)(millis() - trialDeadlineMs) >= 0) {
+    // A real call confirmed/in flight: hold the rollback so the restart doesn't wipe
+    // it -- but only briefly. This image failed because it can't reach ntfy, so the
+    // call may never deliver from here; after 2 min, roll back regardless.
+    if ((int32_t)(millis() - trialDeadlineMs) < 120000 && realCallInFlight()) return;
     Serial.println(F("[ota] probation FAILED -- rolling back"));
     // Remember THIS version (the trial image's own FW_VERSION) as failed BEFORE we
     // revert, so the rolled-back old image refuses to re-stage it next interval and
@@ -2029,8 +2037,9 @@ void loop() {
     if (WiFi.status() == WL_CONNECTED) statusConnected(); else statusError();
   }
 
-  // Deferred reboot (set by /reboot) -- lets the HTTP reply flush first.
-  if (pendingRebootMs && (int32_t)(millis() - pendingRebootMs) >= 0) {
+  // Deferred reboot (/reboot, OTA staged) -- lets the HTTP reply flush first.
+  if (pendingRebootMs && (int32_t)(millis() - pendingRebootMs) >= 0
+      && !realCallInFlight()) {                // hold while a real call is confirmed / being delivered
     Serial.println(F("[web] reboot requested"));
     delay(50);
     ESP.restart();
@@ -2165,6 +2174,15 @@ static void handleRing() {
   }
 }
 
+// True while a REAL call is confirmed but not yet handed to the pipeline, or still
+// being delivered. Every intentional restart checks this first: a reboot wipes the
+// RAM-only call latch AND the sampler's pending page, so the crew would never hear
+// about that call (and the detector would have to re-arm and see 2 more rings).
+static bool realCallInFlight() {
+  handleRing();                         // hand any confirmed page to the pipeline first
+  return callPending && !callSimulated;
+}
+
 // STATUS note (at most one ATTEMPT per IGNORED_PING_MS -- throttled on attempts,
 // not successes, so an ntfy outage can't turn it into a send-every-loop storm)
 // when line activity was ignored: a replug/brownout is visible without paging
@@ -2194,6 +2212,13 @@ static void serviceIgnoredActivity() {
 // never read idle for 3 s straight): until it arms, a real call would NOT page.
 // Attempt-throttled; re-arms the warning if it ever disarms again (it doesn't today).
 static void serviceArmCheck() {
+  static bool samplerWarned = false;
+  if (!ringTimerOk && !samplerWarned && WiFi.status() == WL_CONNECTED) {
+    samplerWarned = sendNtfy(C.ntfyStatus.c_str(), "Ring sampler degraded",
+      "The 5 ms ring-sampling timer failed to start, so D4 is sampled from the main loop. "
+      "Network sends can now hide or split rings. Reboot the device; report it if this repeats.",
+      "high", "warning");
+  }
   static uint32_t lastTryMs = 0;
   static bool     warned    = false;
   if (ringDet.armed) { warned = false; return; }
