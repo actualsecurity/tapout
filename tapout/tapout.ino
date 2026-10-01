@@ -147,11 +147,13 @@ static inline uint32_t clampOtaInterval(uint32_t v) {
   return v;
 }
 
-// Single-mode ring threshold bounds: below ~100 ms is glitch territory; above
-// 3 s would miss a ring cut short by a transfer to dispatch.
+// Single-mode ring threshold bounds: below ~100 ms is glitch territory. The
+// ceiling stays well under a normal ~2 s US ring: at >= ~2 s every ring would end
+// before reaching the threshold and NO call would ever page.
+static const uint32_t RING_MIN_MS_MAX = 1500;
 static inline uint32_t clampRingMinMs(uint32_t v) {
-  if (v < 100)  return 100;
-  if (v > 3000) return 3000;
+  if (v < 100)             return 100;
+  if (v > RING_MIN_MS_MAX) return RING_MIN_MS_MAX;
   return v;
 }
 

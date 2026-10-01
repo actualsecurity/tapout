@@ -49,6 +49,7 @@
 #define RD_MAX_GAP_MS    8000UL  // next burst must start within this of the previous ending (US gap ~4 s)
 #define RD_RULE_B_BURSTS    3    // rule B: this many >= 0.3 s bursts in a row
 #define RD_SINGLE_MIN_DEFAULT_MS 500UL   // single mode: page once a burst lasts this long
+                                         // (firmware caps it at 1500: a US ring is ~2 s)
 
 #define RD_MODE_SINGLE   0       // page on the first ring (default; zero-initialised)
 #define RD_MODE_PATTERN  1       // page only on a 2-ring pattern

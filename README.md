@@ -72,7 +72,7 @@ These all still work in v2.0.0 and run **before** any of the new code each loop:
   power unplug/replug, can never page. Two modes, set by `ring_mode` (NVS,
   applied live):
   - **`single` (default):** pages once **one** ring has lasted `ring_min_ms`
-    (default 500 ms, range 100–3000), i.e. on the **first** ring. The station
+    (default 500 ms, range 100–1500; a normal ring is ~2 s, so higher could miss every call), i.e. on the **first** ring. The station
     line may ring only once before the call rolls to county dispatch.
     Shorter blips are ignored.
     - Trade-off: a power sag of at least `ring_min_ms` while the board stays
