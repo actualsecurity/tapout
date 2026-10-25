@@ -95,6 +95,8 @@
 #include <DNSServer.h>      // captive-portal DNS for the SoftAP setup mode
 #include <esp_timer.h>      // 5 ms D4 sampler, independent of loop() (ring detection)
 #include <esp_core_dump.h>  // read + report a saved crash dump after a crash reboot
+#include <esp_app_desc.h>   // esp_app_get_elf_sha256: which build a crash dump came from
+#include <stdarg.h>
 #include "public_key.h"     // RSA-2048 signing public key (RAIL A) -- committed, not secret
 #include "ring_detect.h"    // ring-PATTERN detector (rejects boot/replug/brownout blips)
 
@@ -389,12 +391,15 @@ static esp_core_dump_summary_t crashSum;
 static char      crashReason[64] = "";
 static uint32_t  savedCallEpoch = 0;        // a real call detected before the restart (NVS), 0 = none
 static bool      savedCallChecked = false;
+static bool      savedCallForce = false;    // held through a self-heal restart: page whatever its age
+static uint8_t   bootEvHead = 0, bootEvPrior = 0;  // where this boot's events start in the ring
 
 static uint32_t callRestoredEpoch = 0;   // != 0: the latched call was saved before a restart
 static char     pendingRebootWhy[72] = "requested reboot";   // recorded by the deferred-reboot handler
 static void boxBoot();
 static void boxSaveCall();
 static void boxClearCall();
+static void boxClearCallIf(uint32_t expect);
 static void boxEvent(uint8_t code, uint16_t arg);
 static void netOk();
 static void netFail(int code);
@@ -610,6 +615,11 @@ static const char* resetReasonToStr(esp_reset_reason_t r) {
     case ESP_RST_EXT:       return "External reset";
     case ESP_RST_DEEPSLEEP: return "Deep-sleep wake";
     case ESP_RST_SDIO:      return "SDIO";
+    case ESP_RST_USB:       return "USB reset";
+    case ESP_RST_JTAG:      return "JTAG reset";
+    case ESP_RST_EFUSE:     return "eFuse error";
+    case ESP_RST_PWR_GLITCH:return "Power glitch";
+    case ESP_RST_CPU_LOCKUP:return "CPU lockup";
     default:                return "Unknown";
   }
 }
@@ -811,7 +821,10 @@ static void fireCallAlert(bool simulated) {
   formatTimestamp(ts, sizeof(ts));
   uint32_t ageS = (millis() - callDetectedMs) / 1000;
   char msg[224];
-  if (callRestoredEpoch && !simulated) {
+  if (callRestoredEpoch == 1 && !simulated) {        // saved before NTP had set the clock
+    snprintf(msg, sizeof(msg),
+      "Phone rang shortly before the device restarted (exact time unknown). This alert was delayed by the restart.");
+  } else if (callRestoredEpoch && !simulated) {
     char when[24];
     time_t t = (time_t)callRestoredEpoch; struct tm lt; localtime_r(&t, &lt);
     strftime(when, sizeof(when), "%H:%M:%S", &lt);
@@ -930,6 +943,7 @@ static void setupOTA() {
   });
 
   ArduinoOTA.onError([](ota_error_t error) {
+    { Preferences bp; bp.begin("fhabox", false); bp.remove("why"); bp.remove("why_boot"); bp.end(); }
     Serial.printf("[ota] ERROR %u -- aborting, keeping old image\n", error);
     // Upload failed: NO reboot, old firmware keeps running. Re-arm the dog we
     // detached in onStart so normal protection resumes.
@@ -2088,6 +2102,7 @@ static void netOk() {
   lastNetOkMs = millis();
   netEverOk = true;
   netFailStreak = 0;
+  netFailProbes = 0;                        // any real success ends a "connected but dead" episode
   healStreak = 0;                           // healthy again: next outage starts the backoff fresh
 }
 static void netFail(int code) {
@@ -2097,21 +2112,28 @@ static void netFail(int code) {
   if (netFailStreak < 255) netFailStreak++;
 }
 
-// A real call latched / delivered: persist so a restart can't silently drop it.
+// A real call latched: persist so a restart can't silently drop it. "force"
+// marks a call held through a restart the DEVICE chose (self-heal): it is
+// re-paged after boot regardless of age, never downgraded to a STATUS note.
 static void boxSaveCall() {
+  if (inSetupMode) return;                  // portal: nothing can be delivered; don't carry test rings over
   time_t now = time(nullptr);
   Preferences p;
   p.begin("fhabox", false);
   p.putUInt("pcall", now > TIME_VALID_EPOCH ? (uint32_t)now : 1);   // 1 = time unknown
+  p.remove("pcall_force");
   p.end();
   boxEvent(EV_CALL, 0);
 }
-static void boxClearCall() {
+// Clear the saved call -- only if it is still the one we think it is (a newer
+// call may have replaced it in the meantime).
+static void boxClearCallIf(uint32_t expect) {
   Preferences p;
   p.begin("fhabox", false);
-  p.remove("pcall");
+  if (expect == 0 || p.getUInt("pcall", 0) == expect) { p.remove("pcall"); p.remove("pcall_force"); }
   p.end();
 }
+static void boxClearCall() { boxClearCallIf(0); }
 
 static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) lastDiscReason = info.wifi_sta_disconnected.reason;
@@ -2126,6 +2148,7 @@ static void boxBoot() {
   String why = p.getString("why", "");
   uint32_t whyBoot = p.getUInt("why_boot", 0);
   savedCallEpoch = p.getUInt("pcall", 0);
+  savedCallForce = p.getBool("pcall_force", false);
   p.end();
 
   bool rtcOk = boxValid(boxRtc);
@@ -2136,8 +2159,18 @@ static void boxBoot() {
   } else if (nvOk) {
     boxPrev = nv; boxPrevValid = true;
   }
-  // A recorded reason only explains THIS restart if the previous boot wrote it.
-  if (why.length() && whyBoot + 1 == bootCount) strncpy(rebootWhy, why.c_str(), sizeof(rebootWhy) - 1);
+  // A recorded reason explains THIS restart only if the previous boot wrote it AND
+  // the chip actually did a software restart (a crash/hang/power cut after a
+  // reason was written -- e.g. a failed OTA that didn't reboot -- must still
+  // read as unexpected).
+  if (why.length() && whyBoot + 1 == bootCount && bootReason == ESP_RST_SW) {
+    size_t o = 0;
+    for (size_t i = 0; i < why.length() && o + 1 < sizeof(rebootWhy); i++) {
+      char ch = why[i];
+      rebootWhy[o++] = (ch >= 0x20 && ch < 0x7f && ch != '"' && ch != '\\') ? ch : '\'';   // JSON/ntfy-safe
+    }
+    rebootWhy[o] = 0;
+  }
   if (why.length()) { p.begin("fhabox", false); p.remove("why"); p.remove("why_boot"); p.end(); }
 
   if (healMagic != BOX_MAGIC) { healMagic = BOX_MAGIC; healStreak = 0; }
@@ -2147,6 +2180,8 @@ static void boxBoot() {
   if (boxPrevValid) { memcpy(box.ev, boxPrev.ev, sizeof(box.ev)); box.head = boxPrev.head; box.count = boxPrev.count; }
   box.magic = BOX_MAGIC;
   box.version = BOX_VERSION;
+  bootEvHead  = box.head;                   // events before this index are the previous boots'
+  bootEvPrior = box.count;
   boxEvent(EV_BOOT, (uint16_t)bootReason);
 
   // Crash dump from a panic / watchdog (saved to the coredump partition by the core).
@@ -2190,7 +2225,7 @@ static const char* discName(uint16_t r) {
   }
 }
 
-// "Oct 04 03:55" from an epoch, or "+3h12m after boot" when the clock wasn't set.
+// "Oct 04 03:55" from an epoch, or "+3h12m up" when the clock wasn't set.
 static void fmtWhen(uint32_t epoch, uint32_t upS, char* out, size_t n) {
   if (epoch) {
     time_t t = (time_t)epoch; struct tm lt; localtime_r(&t, &lt);
@@ -2200,73 +2235,94 @@ static void fmtWhen(uint32_t epoch, uint32_t upS, char* out, size_t n) {
   }
 }
 
+// Bounds-safe append: never lets n run past the buffer (snprintf returns the
+// would-be length, so naive "n += snprintf(...)" chains can underflow cap - n).
+static int appendf(char* buf, size_t cap, int n, const char* fmt, ...) {
+  if (n < 0 || (size_t)n >= cap - 1) return (int)cap - 1;
+  va_list ap;
+  va_start(ap, fmt);
+  int w = vsnprintf(buf + n, cap - (size_t)n, fmt, ap);
+  va_end(ap);
+  if (w < 0) return n;
+  return (size_t)(n + w) >= cap ? (int)cap - 1 : n + w;
+}
+
+// Attempt throttle shared by the one-shot reports (an ntfy that is reachable but
+// failing must not turn them into a send-every-loop-pass storm).
+static const uint32_t REPORT_RETRY_MS = 60UL * 1000UL;
+
 // The restart report: sent once per boot, as soon as WiFi is up and the clock is
 // set (or 90 s after WiFi, so a broken NTP can't hold it back forever).
 static void serviceRestartReport() {
-  static uint32_t wifiUpAtMs = 0;
+  static uint32_t wifiUpAtMs = 0, lastTryMs = 0;
   if (restartReported) return;
   if (WiFi.status() != WL_CONNECTED) { wifiUpAtMs = 0; return; }
   if (!wifiUpAtMs) wifiUpAtMs = millis();
   if (!timeSynced() && millis() - wifiUpAtMs < 90000) return;
+  if (lastTryMs && millis() - lastTryMs < REPORT_RETRY_MS) return;
+  lastTryMs = millis();
 
   bool unexpected = true;
   const char* cause;
   if (rebootWhy[0]) { cause = "requested restart"; unexpected = false; }
   else switch (bootReason) {
-    case ESP_RST_POWERON:  cause = "POWER LOSS: it was unplugged, power-cycled, the reset button was pressed, or the supply cut out"; break;
-    case ESP_RST_BROWNOUT: cause = "BROWNOUT: the power supply sagged too low (check the USB supply/cable)"; break;
-    case ESP_RST_PANIC:    cause = "CRASH: the firmware crashed and restarted itself"; break;
+    case ESP_RST_POWERON:    cause = "POWER LOSS: it was unplugged, power-cycled, the reset button was pressed, or the supply cut out"; break;
+    case ESP_RST_BROWNOUT:   cause = "BROWNOUT: the power supply sagged too low (check the USB supply/cable)"; break;
+    case ESP_RST_PWR_GLITCH: cause = "POWER GLITCH on the supply"; break;
+    case ESP_RST_PANIC:      cause = "CRASH: the firmware crashed and restarted itself"; break;
     case ESP_RST_TASK_WDT:
     case ESP_RST_INT_WDT:
-    case ESP_RST_WDT:      cause = "HANG: the firmware froze and the watchdog restarted it"; break;
-    case ESP_RST_SW:       cause = "software restart with no recorded reason"; break;
-    default:               cause = gResetReason; break;
+    case ESP_RST_WDT:        cause = "HANG: the firmware froze and the watchdog restarted it"; break;
+    case ESP_RST_SW:         cause = "software restart with no recorded reason"; break;
+    case ESP_RST_USB:        cause = "USB reset (e.g. reflashed over the cable)"; break;
+    default:                 cause = gResetReason; break;
   }
   if (!boxPrevValid && !rebootWhy[0]) { cause = "first boot with the black-box recorder (no history yet)"; unexpected = false; }
 
   static char msg[1400];
-  int n = snprintf(msg, sizeof(msg), "Boot #%lu. Cause: %s%s%s%s.",
-                   (unsigned long)bootCount, cause, rebootWhy[0] ? " (" : "", rebootWhy, rebootWhy[0] ? ")" : "");
+  const size_t cap = sizeof(msg);
+  int n = appendf(msg, cap, 0, "Boot #%lu. Cause: %s%s%s%s.",
+                  (unsigned long)bootCount, cause, rebootWhy[0] ? " (" : "", rebootWhy, rebootWhy[0] ? ")" : "");
   if (boxPrevValid) {
     const BoxCp& c = boxPrev.cp;
     char when[24]; fmtWhen(c.epoch, c.upS, when, sizeof(when));
+    char ofBoot[24] = "";
+    if (c.bootCount + 1 != bootCount) snprintf(ofBoot, sizeof(ofBoot), " (from boot #%lu)", (unsigned long)c.bootCount);
     time_t now = time(nullptr);
     if (c.epoch && now > TIME_VALID_EPOCH && (uint32_t)now > c.epoch) {
-      n += snprintf(msg + n, sizeof(msg) - n, " Last sign of life %s (%s ago)%s.", when,
-                    fmtDuration(min((uint32_t)now - c.epoch, (uint32_t)(40UL * 86400UL)) * 1000UL).c_str(),
-                    boxPrevFromRtc ? "" : ", within ~5 min");
+      n = appendf(msg, cap, n, " Last sign of life %s%s (%s ago)%s.", when, ofBoot,
+                  fmtDuration(min((uint32_t)now - c.epoch, (uint32_t)(40UL * 86400UL)) * 1000UL).c_str(),
+                  boxPrevFromRtc ? "" : ", within ~5 min");
     } else {
-      n += snprintf(msg + n, sizeof(msg) - n, " Last checkpoint %s.", when);
+      n = appendf(msg, cap, n, " Last checkpoint %s%s.", when, ofBoot);
     }
     char ok[32];
     if (c.sinceOkS == 0xFFFFFFFFu) snprintf(ok, sizeof(ok), "never");
     else snprintf(ok, sizeof(ok), "%s earlier", fmtDuration(c.sinceOkS * 1000UL).c_str());
-    n += snprintf(msg + n, sizeof(msg) - n,
-      " Just before: up %s, WiFi %s", fmtDuration(c.upS * 1000UL).c_str(), c.wifiUp ? "up" : "DOWN");
-    if (c.wifiUp) n += snprintf(msg + n, sizeof(msg) - n, " %d dBm", (int)c.rssi);
-    n += snprintf(msg + n, sizeof(msg) - n,
-      ", last successful send %s, %u failures in a row, %u WiFi drops that boot",
-      ok, (unsigned)c.failStreak, (unsigned)c.wifiDrops);
-    if (c.lastDisc) n += snprintf(msg + n, sizeof(msg) - n, " (last: %u %s)", (unsigned)c.lastDisc, discName(c.lastDisc));
-    n += snprintf(msg + n, sizeof(msg) - n, ", heap %lu KB free (largest %lu KB, low-water %lu KB).",
-                  (unsigned long)(c.freeHeap / 1024), (unsigned long)(c.largest / 1024), (unsigned long)(c.minFree / 1024));
+    n = appendf(msg, cap, n, " Just before: up %s, WiFi %s", fmtDuration(c.upS * 1000UL).c_str(), c.wifiUp ? "up" : "DOWN");
+    if (c.wifiUp) n = appendf(msg, cap, n, " %d dBm", (int)c.rssi);
+    n = appendf(msg, cap, n, ", last successful send %s, %u failures in a row, %u WiFi drops that boot",
+                ok, (unsigned)c.failStreak, (unsigned)c.wifiDrops);
+    if (c.lastDisc) n = appendf(msg, cap, n, " (last: %u %s)", (unsigned)c.lastDisc, discName(c.lastDisc));
+    n = appendf(msg, cap, n, ", heap %lu KB free (largest %lu KB, low-water %lu KB).",
+                (unsigned long)(c.freeHeap / 1024), (unsigned long)(c.largest / 1024), (unsigned long)(c.minFree / 1024));
   }
-  // Recent events, oldest first, skipping the boot we just logged.
-  if (box.count > 1) {
-    n += snprintf(msg + n, sizeof(msg) - n, " Recent events:");
-    uint8_t shown = box.count - 1 < 8 ? box.count - 1 : 8;
-    for (uint8_t i = shown; i >= 1 && n < (int)sizeof(msg) - 80; i--) {
-      const BoxEvt& e = box.ev[(box.head + BOX_EVENTS - 1 - i) % BOX_EVENTS];
+  // Events from BEFORE this boot, oldest first (the last 8).
+  uint8_t shown = bootEvPrior < 8 ? bootEvPrior : 8;
+  if (shown) {
+    n = appendf(msg, cap, n, " Recent events:");
+    for (uint8_t i = shown; i >= 1; i--) {
+      const BoxEvt& e = box.ev[(bootEvHead + BOX_EVENTS - i) % BOX_EVENTS];
       char when[24]; fmtWhen(e.epoch, e.upS, when, sizeof(when));
-      n += snprintf(msg + n, sizeof(msg) - n, " %s %s", when, evName(e.code));
-      if (e.code == EV_WIFI_LOST && e.arg) n += snprintf(msg + n, sizeof(msg) - n, " (%u %s)", (unsigned)e.arg, discName(e.arg));
-      else if (e.code == EV_BOOT) n += snprintf(msg + n, sizeof(msg) - n, " (%s)", resetReasonToStr((esp_reset_reason_t)e.arg));
+      n = appendf(msg, cap, n, " %s %s", when, evName(e.code));
+      if (e.code == EV_WIFI_LOST && e.arg) n = appendf(msg, cap, n, " (%u %s)", (unsigned)e.arg, discName(e.arg));
+      else if (e.code == EV_BOOT) n = appendf(msg, cap, n, " (%s)", resetReasonToStr((esp_reset_reason_t)e.arg));
       else if (e.code == EV_SEND_FAIL)
-        n += snprintf(msg + n, sizeof(msg) - n, " (HTTP %d)", (e.arg & 0x8000) ? -(int)(e.arg & 0x7FFF) : (int)e.arg);
-      n += snprintf(msg + n, sizeof(msg) - n, ";");
+        n = appendf(msg, cap, n, " (HTTP %d)", (e.arg & 0x8000) ? -(int)(e.arg & 0x7FFF) : (int)e.arg);
+      n = appendf(msg, cap, n, ";");
     }
   }
-  if (savedCallEpoch) n += snprintf(msg + n, sizeof(msg) - n, " A call was detected before the restart (see next alert).");
+  if (savedCallEpoch) n = appendf(msg, cap, n, " A call was detected before the restart (see the next alert).");
 
   if (sendNtfy(C.ntfyStatus.c_str(), unexpected ? "Tapout restarted UNEXPECTEDLY" : "Tapout restarted",
                msg, unexpected ? "high" : "low", unexpected ? "warning,arrows_counterclockwise" : "arrows_counterclockwise")) {
@@ -2275,18 +2331,28 @@ static void serviceRestartReport() {
   }
 }
 
-// One-time crash summary (task, PC, backtrace) -- decode the addresses with the
-// release's tapout.ino.elf:  xtensa-esp32s3-elf-addr2line -pfiaC -e tapout.ino.elf <addrs>
+// One-time crash summary (task, PC, backtrace). The dump may be from an EARLIER
+// firmware (v2.0.9 never erased dumps), so identify the crashed build by its ELF
+// SHA-256 prefix rather than assuming it is the running version.
 static void serviceCrashReport() {
+  static uint32_t lastTryMs = 0;
   if (!crashPending || !restartReported || WiFi.status() != WL_CONNECTED) return;
-  static char msg[600];
-  int n = snprintf(msg, sizeof(msg), "A crash dump was saved%s%s. Task '%s', PC 0x%08lx, exception cause %lu, addr 0x%08lx. Backtrace%s:",
-                   crashReason[0] ? ": " : "", crashReason, crashSum.exc_task, (unsigned long)crashSum.exc_pc,
-                   (unsigned long)crashSum.ex_info.exc_cause, (unsigned long)crashSum.ex_info.exc_vaddr,
-                   crashSum.exc_bt_info.corrupted ? " (partly corrupted)" : "");
-  for (uint32_t i = 0; i < crashSum.exc_bt_info.depth && i < 16 && n < (int)sizeof(msg) - 16; i++)
-    n += snprintf(msg + n, sizeof(msg) - n, " 0x%08lx", (unsigned long)crashSum.exc_bt_info.bt[i]);
-  snprintf(msg + n, sizeof(msg) - n, ". Firmware v%s; decode with that release's tapout.ino.elf (addr2line).", FW_VERSION);
+  if (lastTryMs && millis() - lastTryMs < REPORT_RETRY_MS) return;
+  lastTryMs = millis();
+  char runSha[APP_ELF_SHA256_SZ] = "";
+  esp_app_get_elf_sha256(runSha, sizeof(runSha));
+  const char* crashSha = (const char*)crashSum.app_elf_sha256;
+  bool thisBuild = runSha[0] && strncmp(runSha, crashSha, sizeof(runSha) - 1) == 0;
+  static char msg[640];
+  const size_t cap = sizeof(msg);
+  int n = appendf(msg, cap, 0, "A crash dump was saved%s%s. Task '%s', PC 0x%08lx, exception cause %lu, addr 0x%08lx. Backtrace%s:",
+                  crashReason[0] ? ": " : "", crashReason, crashSum.exc_task, (unsigned long)crashSum.exc_pc,
+                  (unsigned long)crashSum.ex_info.exc_cause, (unsigned long)crashSum.ex_info.exc_vaddr,
+                  crashSum.exc_bt_info.corrupted ? " (partly corrupted)" : "");
+  for (uint32_t i = 0; i < crashSum.exc_bt_info.depth && i < 16; i++)
+    n = appendf(msg, cap, n, " 0x%08lx", (unsigned long)crashSum.exc_bt_info.bt[i]);
+  if (thisBuild) n = appendf(msg, cap, n, ". Crashed build = this firmware (v%s, ELF %s): decode with its tapout.ino.elf (addr2line).", FW_VERSION, crashSha);
+  else           n = appendf(msg, cap, n, ". Crashed build ELF %s is NOT the running v%s (an earlier firmware): decode with the release whose tapout.ino.elf matches.", crashSha, FW_VERSION);
   if (sendNtfy(C.ntfyStatus.c_str(), "Tapout crash report", msg, "high", "boom")) {
     esp_core_dump_image_erase();             // report each crash once
     crashPending = false;
@@ -2295,17 +2361,18 @@ static void serviceCrashReport() {
 
 // Re-send (or report) a real call that was detected before the restart.
 static void serviceSavedCall() {
+  static uint32_t lastTryMs = 0;
   if (!savedCallEpoch || savedCallChecked || WiFi.status() != WL_CONNECTED) return;
   if (!timeSynced() && millis() < 120000) return;     // give NTP a chance to judge the age
-  savedCallChecked = true;
+  if (lastTryMs && millis() - lastTryMs < REPORT_RETRY_MS) return;
+  lastTryMs = millis();
   time_t now = time(nullptr);
   bool known = savedCallEpoch > 1 && now > TIME_VALID_EPOCH && (uint32_t)now >= savedCallEpoch;
   uint32_t ageS = known ? (uint32_t)now - savedCallEpoch : 0;
-  if (known && ageS <= RESTORED_CALL_MAX_S && callPending && !callSimulated) {
-    boxClearCall();                            // a newer real call is already being paged
-    return;
-  }
-  if (known && ageS <= RESTORED_CALL_MAX_S) {
+  // Page it if fresh -- or ALWAYS if the device itself chose the restart that held
+  // it up (self-heal), so healing can never downgrade a real call.
+  if (savedCallForce || (known && ageS <= RESTORED_CALL_MAX_S)) {
+    savedCallChecked = true;
     callRestoredEpoch = savedCallEpoch;        // fireCallAlert words it as "delayed"
     callPending    = true;
     callSimulated  = false;
@@ -2320,14 +2387,23 @@ static void serviceSavedCall() {
   snprintf(msg, sizeof(msg), "A real call was detected %s but its alert was not delivered before the device "
            "restarted. %s, so the crew was NOT paged now.", known ? when : "(time unknown)",
            known ? "It is too old to page" : "Its age is unknown");
-  if (sendNtfy(C.ntfyStatus.c_str(), "Undelivered call before restart", msg, "high", "warning")) boxClearCall();
-  else savedCallChecked = false;               // retry next pass
+  if (sendNtfy(C.ntfyStatus.c_str(), "Undelivered call before restart", msg, "high", "warning")) {
+    savedCallChecked = true;
+    boxClearCallIf(savedCallEpoch);            // only if no newer call replaced it
+  }
 }
 
-// Self-restart for healing; never during OTA trial/download. A pending real call
-// is already saved (boxSaveCall), so it survives this.
+// Self-restart for healing; never during OTA trial/download. Any just-confirmed
+// ring is handed to the pipeline (and so saved) first, and a real call that is
+// still latched is flagged "force" so it pages after boot whatever its age.
 static void selfHealReboot(const char* why) {
   if (g_onProbation || otaState != PULL_OTA_IDLE || otaInProgress) return;
+  if (realCallInFlight()) {                    // hands over ringPagesPending -> boxSaveCall
+    Preferences p;
+    p.begin("fhabox", false);
+    p.putBool("pcall_force", true);
+    p.end();
+  }
   healStreak++;
   boxEvent(EV_HEAL_REBOOT, 0);
   noteReboot(why);
@@ -2359,8 +2435,7 @@ static void serviceBlackBox() {
     lastProbeMs = millis();
     if (httpGetBounded((C.ntfyStatus + "/json?poll=1&since=1s").c_str())) {   // no message is created
       if (netFailProbes) boxEvent(EV_NET_UP, netFailProbes);
-      netFailProbes = 0;
-      healStreak = 0;
+      netFailProbes = 0;                       // (netOk() also clears it)
       return;
     }
     netFailProbes++;
@@ -2370,11 +2445,16 @@ static void serviceBlackBox() {
       Serial.println(F("[heal] WiFi up but nothing gets through -- forcing a reconnect"));
       WiFi.disconnect();
       WiFi.begin(C.wifiSsid.c_str(), C.wifiPass.c_str());
+      // Keep serviceWifi() from immediately tearing this reconnect down again.
+      lastWifiAttempt = millis();
+      wifiBackoffMs   = 15000;
     } else if (netFailProbes >= NET_HEAL_REBOOT) {
       selfHealReboot("self-heal: WiFi said connected but nothing got through for ~25 min");
     }
   } else {
-    netFailProbes = 0;
+    // NOTE: netFailProbes is deliberately NOT reset here -- the self-heal reconnect
+    // itself drops WiFi briefly, and resetting would loop reconnects forever
+    // without ever reaching the reboot. Only a real success (netOk) clears it.
     if (!wifiDownSinceMs) wifiDownSinceMs = millis();
     uint32_t limit = WIFI_DOWN_REBOOT_MS << (healStreak < 3 ? healStreak : 3);
     if (millis() - wifiDownSinceMs >= limit) {
@@ -2557,9 +2637,9 @@ void loop() {
   serviceHeapCheck();           // low-heap canary (throttled)
   serviceIgnoredActivity();     // STATUS note for non-ring line activity (throttled)
   serviceArmCheck();            // STATUS warning if ring detection never armed
+  serviceSavedCall();           // re-send a real call saved before a restart (before STATUS reports)
   serviceRestartReport();       // once per boot: why it restarted + what it looked like before
   serviceCrashReport();         // once: summary of a saved crash dump
-  serviceSavedCall();           // re-send a real call saved before a restart
   serviceBlackBox();            // checkpoints, WiFi events, connectivity probe, self-heal
   serviceDeadman();             // external check-in, withheld when degraded (opt-in)
   server.handleClient();        // serve status page / json / actions (fast)
@@ -2805,7 +2885,13 @@ static void triggerRingPipeline(bool simulated) {
   ringLedUntil = now + RING_LED_HOLD_MS;   // non-blocking red hold (loop releases)
 
   recordRing(simulated);                   // persist to NVS log (also resets WDT)
-  if (!simulated) boxSaveCall();           // survives a restart until delivered
+  if (!simulated) {
+    boxSaveCall();                         // survives a restart until delivered
+    if (savedCallEpoch && !savedCallChecked) {   // a call saved before the restart is superseded:
+      savedCallChecked = true;                   // this ring already pages, don't page twice
+      savedCallEpoch = 0;
+    }
+  }
   callRestoredEpoch = 0;                   // a fresh ring supersedes any restored one
 
   // Latch the call and fire immediately; serviceCallQueue() retries on failure
