@@ -823,12 +823,13 @@ static void fireCallAlert(bool simulated) {
   char msg[224];
   if (callRestoredEpoch == 1 && !simulated) {        // saved before NTP had set the clock
     snprintf(msg, sizeof(msg),
-      "Phone rang shortly before the device restarted (exact time unknown). This alert was delayed by the restart.");
+      "Phone rang before the device restarted (exact time unknown). This alert was delayed by the restart.");
   } else if (callRestoredEpoch && !simulated) {
-    char when[24];
+    char when[32];
     time_t t = (time_t)callRestoredEpoch; struct tm lt; localtime_r(&t, &lt);
-    strftime(when, sizeof(when), "%H:%M:%S", &lt);
     time_t now = time(nullptr);
+    // Held through a long outage: give the date so nobody reads it as today's.
+    strftime(when, sizeof(when), (now - t > 12 * 3600) ? "%b %d %H:%M:%S" : "%H:%M:%S", &lt);
     snprintf(msg, sizeof(msg),
       "Phone rang at %s. This alert was delayed ~%lu min because the device restarted.",
       when, (unsigned long)(now > (time_t)callRestoredEpoch ? (now - callRestoredEpoch + 59) / 60 : 1));
@@ -2256,6 +2257,10 @@ static const uint32_t REPORT_RETRY_MS = 60UL * 1000UL;
 static void serviceRestartReport() {
   static uint32_t wifiUpAtMs = 0, lastTryMs = 0;
   if (restartReported) return;
+  // A call saved before the restart goes out FIRST: the report (one more TLS
+  // POST) must never delay a crew page. (Also reached via announceOnlineOnce.)
+  serviceSavedCall();
+  if (savedCallEpoch && !savedCallChecked) return;
   if (WiFi.status() != WL_CONNECTED) { wifiUpAtMs = 0; return; }
   if (!wifiUpAtMs) wifiUpAtMs = millis();
   if (!timeSynced() && millis() - wifiUpAtMs < 90000) return;
@@ -2312,7 +2317,7 @@ static void serviceRestartReport() {
   if (shown) {
     n = appendf(msg, cap, n, " Recent events:");
     for (uint8_t i = shown; i >= 1; i--) {
-      const BoxEvt& e = box.ev[(bootEvHead + BOX_EVENTS - i) % BOX_EVENTS];
+      const BoxEvt& e = boxPrev.ev[(bootEvHead + BOX_EVENTS - i) % BOX_EVENTS];
       char when[24]; fmtWhen(e.epoch, e.upS, when, sizeof(when));
       n = appendf(msg, cap, n, " %s %s", when, evName(e.code));
       if (e.code == EV_WIFI_LOST && e.arg) n = appendf(msg, cap, n, " (%u %s)", (unsigned)e.arg, discName(e.arg));
@@ -2363,7 +2368,7 @@ static void serviceCrashReport() {
 static void serviceSavedCall() {
   static uint32_t lastTryMs = 0;
   if (!savedCallEpoch || savedCallChecked || WiFi.status() != WL_CONNECTED) return;
-  if (!timeSynced() && millis() < 120000) return;     // give NTP a chance to judge the age
+  if (!savedCallForce && !timeSynced() && millis() < 120000) return;   // give NTP a chance to judge the age
   if (lastTryMs && millis() - lastTryMs < REPORT_RETRY_MS) return;
   lastTryMs = millis();
   time_t now = time(nullptr);
@@ -2433,8 +2438,9 @@ static void serviceBlackBox() {
     bool quiet = !netEverOk || millis() - lastNetOkMs >= NET_PROBE_MS;
     if (!quiet || (lastProbeMs && millis() - lastProbeMs < NET_PROBE_MS)) return;
     lastProbeMs = millis();
+    const uint8_t failedBefore = netFailProbes;            // netOk() inside the GET clears it
     if (httpGetBounded((C.ntfyStatus + "/json?poll=1&since=1s").c_str())) {   // no message is created
-      if (netFailProbes) boxEvent(EV_NET_UP, netFailProbes);
+      if (failedBefore) boxEvent(EV_NET_UP, failedBefore);
       netFailProbes = 0;                       // (netOk() also clears it)
       return;
     }
