@@ -395,6 +395,13 @@ static bool      savedCallForce = false;    // held through a self-heal restart:
 static uint8_t   bootEvHead = 0, bootEvPrior = 0;  // where this boot's events start in the ring
 
 static uint32_t callRestoredEpoch = 0;   // != 0: the latched call was saved before a restart
+static uint32_t callRingEpoch = 0;       // wall-clock time the phone rang (0 = unknown / clock unsynced)
+static int      lastNtfyCode = 0;        // last sendNtfy() result (HTTP code, or <0 transport error)
+// Crew-channel gate: sendNtfy() refuses the CALL topic unless this is set, and
+// only fireCallAlert() sets it (around its one send). Nothing else -- status,
+// health, OTA, diagnostics, future code -- can ever reach the crew channel.
+static bool     crewSendOpen = false;
+static int      callFirstFailCode = 0;   // error of the FIRST failed send of the current call (STATUS log)
 static char     pendingRebootWhy[72] = "requested reboot";   // recorded by the deferred-reboot handler
 static void boxBoot();
 static void boxSaveCall();
@@ -817,30 +824,24 @@ static void fireCallAlert(bool simulated) {
   // genuine HTTP failures while actually CONNECTED.
   if (WiFi.status() != WL_CONNECTED) return;
 
+  // The CREW message is ALWAYS the standard alert -- "Incoming call on the station
+  // line at <when the phone rang>." -- whether it goes out first try, on a retry,
+  // or after a restart. Delivery/health detail (late, retried, restored) never
+  // goes on the CALL topic: it is reported on STATUS after delivery (below).
+  // (v2.0.9 switched to "Phone rang ~Ns ago ... (alert delayed by network)" on a
+  // retry, which leaked network-health detail into the crew channel.)
   char ts[48];
-  formatTimestamp(ts, sizeof(ts));
-  uint32_t ageS = (millis() - callDetectedMs) / 1000;
-  char msg[224];
-  if (callRestoredEpoch == 1 && !simulated) {        // saved before NTP had set the clock
-    snprintf(msg, sizeof(msg),
-      "Phone rang before the device restarted (exact time unknown). This alert was delayed by the restart.");
+  if (callRingEpoch) {
+    time_t t = (time_t)callRingEpoch; struct tm lt; localtime_r(&t, &lt);
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S %Z", &lt);   // same format as formatTimestamp()
   } else if (callRestoredEpoch && !simulated) {
-    char when[32];
-    time_t t = (time_t)callRestoredEpoch; struct tm lt; localtime_r(&t, &lt);
-    time_t now = time(nullptr);
-    // Held through a long outage: give the date so nobody reads it as today's.
-    strftime(when, sizeof(when), (now - t > 12 * 3600) ? "%b %d %H:%M:%S" : "%H:%M:%S", &lt);
-    snprintf(msg, sizeof(msg),
-      "Phone rang at %s. This alert was delayed ~%lu min because the device restarted.",
-      when, (unsigned long)(now > (time_t)callRestoredEpoch ? (now - callRestoredEpoch + 59) / 60 : 1));
-  } else if (ageS < 3) {
-    snprintf(msg, sizeof(msg),
-      "Incoming call on the station line at %s.", ts);
+    ts[0] = 0;                                                 // saved before NTP: time unknown
   } else {
-    snprintf(msg, sizeof(msg),
-      "Phone rang ~%lus ago at %s (alert delayed by network).",
-      (unsigned long)ageS, ts);
+    formatTimestamp(ts, sizeof(ts));                           // clock unsynced: uptime form, as before
   }
+  char msg[224];
+  if (ts[0]) snprintf(msg, sizeof(msg), "Incoming call on the station line at %s.", ts);
+  else       snprintf(msg, sizeof(msg), "Incoming call on the station line.");
 
   // Real ring: byte-identical to v1.1.0 (CALL topic, max priority).
   // Simulation: same message body (so the full TLS POST path is exercised) but
@@ -871,7 +872,13 @@ static void fireCallAlert(bool simulated) {
     }
   }
 
-  if (sendNtfy(url, title, msg, prio, tags)) {
+  const int failCode = lastNtfyCode;     // error from the previous failed attempt (for the STATUS note)
+  const bool wasRestored = callRestoredEpoch && !simulated;
+  crewSendOpen = true;                   // the ONLY place allowed to post to the CALL topic
+  const bool sent = sendNtfy(url, title, msg, prio, tags);
+  crewSendOpen = false;
+  if (!sent && callAttempts == 0) callFirstFailCode = lastNtfyCode;   // logged on STATUS later
+  if (sent) {
     callPending = false;                 // delivered
     if (!simulated) {
       boxClearCall();                    // delivered: nothing to re-send after a restart
@@ -885,6 +892,29 @@ static void fireCallAlert(bool simulated) {
       esp_task_wdt_reset();
       Serial.printf("[ring] CALL alert delivered (real_calls_delivered=%lu)\n",
                     (unsigned long)realCallsDelivered);
+      // Late / retried / restored delivery: say so on STATUS -- the crew got the
+      // standard alert above. (Captured before the restored flag is cleared.)
+      uint32_t lateS = (millis() - callDetectedMs) / 1000;
+      if (wasRestored || callAttempts > 0 || lateS >= 3) {
+        char note[260];
+        char after[40] = "";
+        time_t wall = time(nullptr);
+        if (callRingEpoch && wall > (time_t)callRingEpoch)
+          snprintf(after, sizeof(after), ", ~%lu min after the ring", (unsigned long)((wall - callRingEpoch + 59) / 60));
+        if (wasRestored)
+          snprintf(note, sizeof(note), "The crew alert for the %s ring was delivered after a device restart%s. "
+                   "The crew got the standard alert.", ts[0] ? ts : "(time unknown)", after);
+        else if (callAttempts > 0)
+          snprintf(note, sizeof(note), "The FIRST send of the crew alert for the %s ring failed (HTTP %d). "
+                   "It went out %lus late on attempt %u%s. The crew got the standard alert.",
+                   ts, callFirstFailCode, (unsigned long)lateS, (unsigned)callAttempts + 1,
+                   callAttempts > 1 ? (failCode != callFirstFailCode ? " (later errors differed)" : "") : "");
+        else
+          snprintf(note, sizeof(note), "The crew alert for the %s ring went out %lus after the ring "
+                   "(WiFi was down or the send was slow). The crew got the standard alert.", ts, (unsigned long)lateS);
+        sendNtfy(C.ntfyStatus.c_str(), callAttempts > 0 ? "Crew alert: first send failed" : "Crew alert delivered late",
+                 note, "default", "hourglass");
+      }
     } else {
       Serial.println(F("[sim] simulated ring alert delivered"));
     }
@@ -892,10 +922,13 @@ static void fireCallAlert(bool simulated) {
     callPending = false;                 // give up; surface on STATUS
     if (!simulated) { boxClearCall(); callRestoredEpoch = 0; }
     Serial.println(F("[ring] CALL alert FAILED after retries"));
-    sendNtfy(C.ntfyStatus.c_str(), "ALERT DELIVERY FAILED",
-             "A ring was detected but the CALL alert could not be delivered "
-             "after retries. Check WiFi / outbound 443 to ntfy.sh.",
-             "high", "warning");
+    {
+      char m[220];
+      snprintf(m, sizeof(m), "A ring was detected (%s) but the crew alert could not be delivered after %u "
+               "attempts (first error HTTP %d, last HTTP %d). Check WiFi / outbound 443 to ntfy.sh.",
+               ts[0] ? ts : "time unknown", (unsigned)callAttempts, callFirstFailCode, lastNtfyCode);
+      sendNtfy(C.ntfyStatus.c_str(), "ALERT DELIVERY FAILED", m, "high", "warning");
+    }
     statusError();
   } else {
     Serial.printf("[ring] CALL alert retry %u/%u pending\n",
@@ -2378,7 +2411,9 @@ static void serviceSavedCall() {
   // it up (self-heal), so healing can never downgrade a real call.
   if (savedCallForce || (known && ageS <= RESTORED_CALL_MAX_S)) {
     savedCallChecked = true;
-    callRestoredEpoch = savedCallEpoch;        // fireCallAlert words it as "delayed"
+    callRestoredEpoch = savedCallEpoch;        // STATUS gets the "delivered after a restart" note
+    callRingEpoch  = savedCallEpoch > 1 ? savedCallEpoch : 0;
+    callFirstFailCode = 0;
     callPending    = true;
     callSimulated  = false;
     callAttempts   = 0;
@@ -2905,6 +2940,12 @@ static void triggerRingPipeline(bool simulated) {
   callPending    = true;
   callSimulated  = simulated;
   callDetectedMs = simulated ? now : ringDetectedAtMs;   // real: when the pattern was confirmed
+  callFirstFailCode = 0;
+  {
+    time_t wall = time(nullptr);
+    uint32_t backS = (now - callDetectedMs) / 1000;      // pattern confirmed slightly before this pass
+    callRingEpoch = wall > TIME_VALID_EPOCH ? (uint32_t)(wall - backS) : 0;
+  }
   callAttempts   = 0;
   lastCallTryMs  = now;
   fireCallAlert(simulated);
@@ -2934,6 +2975,10 @@ static void handleHeartbeat() {
 // ---------------------- ntfy notification -------------------------------
 static bool sendNtfy(const char* url, const char* title, const char* message,
                      const char* priority, const char* tags) {
+  if (!crewSendOpen && C.ntfyCall.length() && strcasecmp(url, C.ntfyCall.c_str()) == 0) {
+    Serial.printf("[ntfy] REFUSED a non-alert message to the crew CALL topic: %s\n", title);
+    return false;                        // crew channel = the standard ring alert only (see crewSendOpen)
+  }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println(F("[ntfy] skipped -- WiFi down"));
     return false;
@@ -2955,6 +3000,7 @@ static bool sendNtfy(const char* url, const char* title, const char* message,
   HTTPClient http;
   if (!http.begin(client, url)) {
     Serial.println(F("[ntfy] http.begin failed"));
+    lastNtfyCode = -1;
     netFail(-1);
     return false;
   }
@@ -2970,6 +3016,7 @@ static bool sendNtfy(const char* url, const char* title, const char* message,
   int code = http.POST((uint8_t*)message, strlen(message));
   esp_task_wdt_reset();
   http.end();
+  lastNtfyCode = code;
 
   if (code > 0 && code < 300) {
     Serial.printf("[ntfy] sent OK (HTTP %d)\n", code);
