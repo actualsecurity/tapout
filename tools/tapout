@@ -1,0 +1,584 @@
+#!/usr/bin/env python3
+"""tapout -- drive a deployed Tapout unit from anywhere via its signed ntfy command topic.
+
+The device polls a PRIVATE ntfy topic for commands signed with YOUR ECDSA P-256 private
+key (wire format: tapout/cmd_proto.h) and acknowledges every one on the STATUS topic.
+Same model as the signed OTA updates: the private key stays on this machine
+(~/.config/tapout/cmd_private_key.pem, mode 600); the device only has the PUBLIC key,
+compiled into the firmware from tapout/cmd_public_key.h. Signing uses the system
+`openssl` binary, so there is nothing to pip-install.
+
+This tool never knows the crew CALL topic URL. Anything reaching the crew goes through
+the device, and only when a signed command explicitly says to=call -- which this CLI
+sends only with `--to call` plus a typed confirmation (or --yes). The crew channel only ever
+carries the standard ring alert, so the ONLY crew-bound command is `sim-ring --to call` (the
+standard alert, [TEST]-labelled); every other message goes to STATUS (the log channel).
+
+Setup (once):
+    tapout init --status-url https://ntfy.sh/<your-status-topic>
+        # -> makes a command topic + key pair, rewrites tapout/cmd_public_key.h:
+        #    commit it and cut a release (the device needs the public key compiled in)
+    tapout provision --device http://<device-ip>        # sets the command topic (no secrets), reboots
+    tapout ping
+
+Everyday:
+    tapout test                                   # STATUS only
+    tapout maint start --minutes 45               # STATUS only
+    tapout sim-ring --to call                     # [TEST] standard alert to the CREW (asks you to confirm)
+    tapout maint end                              # closes on whatever channel it opened on
+    tapout send -m "Line work Tue 0900"           # custom message to STATUS (alias of announce)
+    tapout send -m "hello" --url other-topic      # custom message to any other ntfy topic
+    tapout test --url other-topic                 # [TEST] to any other ntfy topic
+    tapout set-topic call https://ntfy.sh/new     # STAGE a crew-topic move (channel check sent there)
+    tapout confirm-topic call                     # ...then activate it once the crew got the check
+    tapout revert-topic call                      # undo the last move (also staged + confirmed)
+    tapout ring-mode single [--min-ms 500]        # page on the 1st ring (default)
+    tapout ring-mode pattern                      # page only on a 2-ring pattern
+    tapout watch                                  # tail STATUS
+
+Config: ~/.config/tapout/config.json (0600), or env TAPOUT_CMD_URL / TAPOUT_STATUS_URL /
+TAPOUT_CMD_PRIVATE_KEY (path to the PEM). Python 3.8+, standard library + openssl.
+"""
+
+import argparse
+import base64
+import re
+import getpass
+import json
+import os
+import secrets
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CONFIG_PATH = os.path.expanduser(os.environ.get("TAPOUT_CONFIG", "~/.config/tapout/config.json"))
+KEY_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "cmd_private_key.pem")
+# Repo copy of the device's public key (this script lives in <repo>/tools/).
+HEADER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tapout", "cmd_public_key.h")
+PRIORITIES = ("min", "low", "default", "high")   # device refuses "max" for announcements
+MAX_TITLE = 60      # device buffers: ti 72 B, b 260 B (decoded, incl. NUL; UTF-8 bytes)
+MAX_BODY = 250
+MAX_URL = 200       # device buffer for u (decoded, incl. NUL)
+MAX_LINE = 1024
+UA = "tapout-cli/1.0"
+
+
+# ----------------------------------------------------------------------------- config
+def load_config():
+    cfg = {}
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+    cfg.setdefault("private_key", KEY_PATH)
+    for key, env in (("cmd_url", "TAPOUT_CMD_URL"), ("status_url", "TAPOUT_STATUS_URL"),
+                     ("private_key", "TAPOUT_CMD_PRIVATE_KEY")):
+        if os.environ.get(env):
+            cfg[key] = os.environ[env]
+    return cfg
+
+
+def save_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG_PATH), mode=0o700, exist_ok=True)
+    fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    os.chmod(CONFIG_PATH, 0o600)
+
+
+def require(cfg, *keys):
+    missing = [k for k in keys if not cfg.get(k)]
+    if missing:
+        die(f"missing config: {', '.join(missing)} -- run `tapout init` (or set TAPOUT_* env vars)")
+
+
+def die(msg, code=1):
+    print(f"tapout: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------- protocol
+def pct(text):
+    # Everything outside [A-Za-z0-9_.-~] is %XX-escaped, so the line has no ; = " or \.
+    return urllib.parse.quote(text, safe="")
+
+
+def openssl(*argv, data=None):
+    try:
+        r = subprocess.run(["openssl", *argv], input=data, capture_output=True, check=False)
+    except FileNotFoundError:
+        die("the `openssl` command is required (it ships with macOS and most Linux distros)")
+    if r.returncode != 0:
+        die(f"openssl {argv[0]} failed: {r.stderr.decode(errors='replace').strip()}")
+    return r.stdout
+
+
+def sign(key_path, data):
+    """ECDSA P-256 / SHA-256 over data -> base64url (no padding) DER signature."""
+    if not os.path.exists(key_path):
+        die(f"no private key at {key_path} -- run `tapout init` (or set TAPOUT_CMD_PRIVATE_KEY)")
+    der = openssl("dgst", "-sha256", "-sign", key_path, data=data)
+    return base64.urlsafe_b64encode(der).decode().rstrip("=")
+
+
+def build_command(key_path, cmd, to=None, minutes=None, priority=None, title=None, body=None,
+                  which=None, url=None, ts_ms=None, nonce=None):
+    """Return the signed one-line command (see tapout/cmd_proto.h)."""
+    if title and any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in title):
+        die("title must be a single line (no newlines/control characters)")
+    if title and len(title.encode()) > MAX_TITLE:
+        die(f"title too long ({len(title.encode())} bytes > {MAX_TITLE})")
+    if body and len(body.encode()) > MAX_BODY:
+        die(f"message too long ({len(body.encode())} bytes > {MAX_BODY})")
+    fields = [
+        "T2",
+        f"ts={ts_ms if ts_ms is not None else int(time.time() * 1000)}",
+        f"id={nonce or secrets.token_hex(4)}",
+        f"c={cmd}",
+    ]
+    if to:
+        fields.append(f"to={to}")
+    if minutes:
+        fields.append(f"m={int(minutes)}")
+    if priority:
+        fields.append(f"p={priority}")
+    if which:
+        fields.append(f"w={which}")
+    if url:
+        if len(url.encode()) >= MAX_URL:
+            die(f"URL too long ({len(url.encode())} bytes, max {MAX_URL - 1})")
+        fields.append(f"u={pct(url)}")
+    if title:
+        fields.append(f"ti={pct(title)}")
+    if body:
+        fields.append(f"b={pct(body)}")
+    signed = ";".join(fields)
+    line = f"{signed};sig={sign(key_path, signed.encode())}"
+    if len(line) > MAX_LINE:
+        die(f"command too long ({len(line)} > {MAX_LINE} bytes); shorten the message")
+    return line
+
+
+def command_id(line):
+    for f in line.split(";"):
+        if f.startswith("id="):
+            return f[3:]
+    return ""
+
+
+# ------------------------------------------------------------------------------- ntfy
+def http(method, url, data=None, headers=None, timeout=15):
+    req = urllib.request.Request(url, data=data, method=method, headers={"User-Agent": UA, **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, r.read().decode("utf-8", "replace")
+
+
+def post_command(cfg, line):
+    # Priority "min" + a fixed title: quiet if anyone ever subscribes to the command topic.
+    status, _ = http("POST", cfg["cmd_url"], data=line.encode(),
+                     headers={"Title": "tapout-cmd", "Priority": "min", "Tags": "robot"})
+    if status >= 300:
+        die(f"ntfy rejected the command (HTTP {status})")
+
+
+def poll_status(status_url, since):
+    url = status_url.rstrip("/") + "/json?poll=1&since=" + urllib.parse.quote(str(since))
+    _, body = http("GET", url)
+    out = []
+    for raw in body.splitlines():
+        try:
+            m = json.loads(raw)
+        except ValueError:
+            continue
+        if m.get("event") == "message":
+            out.append(m)
+    return out
+
+
+def wait_for_ack(cfg, cid, since_epoch, timeout):
+    """Poll STATUS until the device's ack containing [id <cid>] shows up."""
+    deadline = time.time() + timeout
+    tag = f"[id {cid}]"
+    seen = set()
+    while time.time() < deadline:
+        try:
+            msgs = poll_status(cfg["status_url"], since_epoch)
+        except (urllib.error.URLError, OSError) as e:
+            print(f"  (status poll error: {e}; retrying)", file=sys.stderr)
+            msgs = []
+        for m in msgs:
+            if m.get("id") in seen:
+                continue
+            seen.add(m.get("id"))
+            if tag in (m.get("message") or ""):
+                return m
+        time.sleep(4)
+    return None
+
+
+# ---------------------------------------------------------------------------- actions
+URL_RE = re.compile(r"^https://([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)/([A-Za-z0-9_-]{1,64})$")
+
+
+def ntfy_url(value, server="https://ntfy.sh"):
+    """Full https://<host>/<topic> URL or a bare topic name (-> https://ntfy.sh/<topic>).
+
+    Same strict shape the device enforces: no port, extra path, ?query or #fragment.
+    """
+    value = value.strip()
+    url = value if "://" in value else f"{server}/{value}"
+    m = URL_RE.match(url)
+    if not m or len(m.group(1)) > 63:
+        die(f"not a usable ntfy URL: {url!r} (want https://<host>/<topic>; topic = letters, digits, - _)")
+    return f"https://{m.group(1).lower()}/{m.group(2)}"
+
+
+def confirm_typed(args, warning, word):
+    print(f"!! {warning}", file=sys.stderr)
+    if args.yes:
+        return
+    if not sys.stdin.isatty():
+        die("refusing non-interactively without --yes")
+    if input(f"   Type '{word}' to confirm: ").strip().lower() != word:
+        die("aborted; nothing sent")
+
+
+def confirm_crew(args, what):
+    if args.to != "call":
+        return
+    print(f"!! This will notify the CREW on the real CALL alert topic: {what}", file=sys.stderr)
+    if args.yes:
+        return
+    if not sys.stdin.isatty():
+        die("refusing to notify the crew non-interactively without --yes")
+    if input("   Type 'crew' to confirm: ").strip().lower() != "crew":
+        die("aborted; nothing sent")
+
+
+def send(args, cfg, cmd, **kw):
+    rc, _ = send_ack(args, cfg, cmd, **kw)
+    return rc
+
+
+def send_ack(args, cfg, cmd, **kw):
+    require(cfg, "cmd_url")
+    line = build_command(cfg["private_key"], cmd, **kw)
+    cid = command_id(line)
+    if args.dry_run:
+        print(line)
+        return 0, None
+    since = int(time.time()) - 5
+    post_command(cfg, line)
+    dest = kw.get("to") or "status"
+    print(f"sent {cmd} (id {cid}, to={dest}) -> command topic")
+    if args.no_wait or not cfg.get("status_url"):
+        if not cfg.get("status_url"):
+            print("  (no status_url configured; not waiting for the device's ack)")
+        return 0, None
+    timeout = args.timeout or 150
+    print(f"waiting up to {timeout}s for the device to pick it up (it polls every ~30s)...")
+    ack = wait_for_ack(cfg, cid, since, timeout)
+    if not ack:
+        print("no acknowledgement yet. The device may be offline, busy on a call, or not "
+              "provisioned for commands; it will still run the command if it picks it up "
+              "within 5 minutes of sending.", file=sys.stderr)
+        return 2, None
+    title = ack.get("title", "")
+    print(f"{title}\n  {ack.get('message', '')}")
+    return (0 if " OK:" in title else 1), ack
+
+
+def cmd_set_topic(args, cfg, revert):
+    which = args.which
+    url = None if revert else ntfy_url(args.url)
+    what = f"switch back to its previous {which} topic" if revert else f"use {url} as its {which} topic"
+    if which == "call":
+        confirm_typed(args, f"The device will STAGE a crew-topic change ({what}). It sends a "
+                            "[TEST] channel check there; nothing switches until `tapout confirm-topic call`.",
+                      "crew")
+    else:
+        if args.no_wait or not cfg.get("status_url"):
+            die(f"set-topic/revert-topic {which} needs the device's ack (drop --no-wait, set status_url) "
+                "so this CLI stays pointed at the device")
+        confirm_typed(args, f"The device will {what}."
+                      + (" Afterwards it only listens on the new command topic." if which == "cmd" else ""),
+                      "yes")
+    cmd = "revert-topic" if revert else "set-topic"
+    rc, ack = send_ack(args, cfg, cmd, which=which, url=url)
+    if args.dry_run:
+        return rc
+    msg = (ack or {}).get("message", "")
+    if which == "call":
+        code = re.search(r"confirm code ([0-9a-f]{6})", msg)
+        if rc == 0 and code:
+            cfg["pending_call_code"] = code.group(1)
+            save_config(cfg)
+            print("\nStaged. Check that the [TEST] channel check reached the crew's phones, then run:\n"
+                  "  tapout confirm-topic call")
+        return rc
+    # Keep the CLI pointed at the device: cmd/status moves change where we post/listen.
+    key = "cmd_url" if which == "cmd" else "status_url"
+    if rc != 0 or f"{which} topic changed" not in msg:
+        if rc == 2:
+            print(f"!! no ack, so {CONFIG_PATH} was NOT updated. If the device did switch "
+                  f"(check `tapout watch`), set {key} there by hand.", file=sys.stderr)
+        return rc
+    old = cfg.get(key)
+    new = cfg.get("prev_" + key) if revert else url
+    if not new:
+        print(f"!! device switched, but the CLI has no record of the previous {key}; "
+              f"set it in {CONFIG_PATH}", file=sys.stderr)
+        return 1
+    cfg[key], cfg["prev_" + key] = new, old
+    save_config(cfg)
+    print(f"updated {CONFIG_PATH}: {key} = {new}")
+    return 0
+
+
+def cmd_confirm_topic(args, cfg):
+    code = args.code or cfg.get("pending_call_code")
+    if not code:
+        die("no staged crew-topic change recorded; run `tapout set-topic call <url>` first "
+            "(or pass --code from the device's STAGED ack)")
+    confirm_typed(args, "The device will switch REAL crew ring alerts to the staged topic now, and post "
+                        "a 'crew alerts have moved' notice on the old crew topic.", "crew")
+    rc, ack = send_ack(args, cfg, "confirm-topic", which="call", body=code)
+    if not args.dry_run and rc == 0 and "call topic changed" in (ack or {}).get("message", ""):
+        cfg.pop("pending_call_code", None)
+        save_config(cfg)
+    return rc
+
+
+def write_header(pub_pem, path):
+    lines = "".join(f'  "{ln}\\n"\n' for ln in pub_pem.strip().splitlines())
+    with open(path, "w") as f:
+        f.write(
+            "// ECDSA P-256 PUBLIC key that verifies remote commands (tools/tapout). Committed,\n"
+            "// not secret -- the matching PRIVATE key lives only on the operator's machine\n"
+            "// (~/.config/tapout/cmd_private_key.pem) and never in this repo.\n"
+            "// Generated by `tapout init`. Rotating it: `tapout init --force`, commit, release.\n"
+            "#pragma once\n"
+            "static const char CMD_PUBLIC_KEY[] =\n" + lines.rstrip("\n") + ";\n")
+
+
+def cmd_init(args, cfg):
+    key_path = cfg["private_key"]
+    if os.path.exists(key_path):
+        if not args.force:
+            die(f"{key_path} already exists; use --force to make a new key pair "
+                "(the device then needs a firmware release with the new public key)")
+        backup = f"{key_path}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+        os.replace(key_path, backup)
+        print(f"old private key moved to {backup}")
+    # Keep the existing command topic (the device is provisioned with it) unless
+    # one is given explicitly; only a first-time init makes up a new one.
+    if args.cmd_topic or not cfg.get("cmd_url"):
+        topic = args.cmd_topic or ("tapout-cmd-" + secrets.token_hex(12))
+        cfg["cmd_url"] = ntfy_url(topic, server=args.server.rstrip("/"))
+    cfg.pop("cmd_key", None)                     # pre-ECDSA shared secret: no longer used
+    if args.status_url:
+        cfg["status_url"] = ntfy_url(args.status_url)
+    os.makedirs(os.path.dirname(key_path), mode=0o700, exist_ok=True)
+    old = os.umask(0o077)
+    try:
+        openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", key_path)
+    finally:
+        os.umask(old)
+    os.chmod(key_path, 0o600)
+    pub = openssl("ec", "-in", key_path, "-pubout").decode()
+    save_config(cfg)
+    print(f"wrote {CONFIG_PATH} and private key {key_path} (mode 600 -- back it up somewhere safe)")
+    print(f"  command topic : {cfg['cmd_url']}")
+    print(f"  status topic  : {cfg.get('status_url') or '(not set -- pass --status-url to see acks)'}")
+    header = os.path.normpath(args.header or HEADER_PATH)
+    if os.path.isdir(os.path.dirname(header)):
+        write_header(pub, header)
+        print(f"  public key    : written to {header}")
+    else:
+        print("  public key    : (repo not found -- put this in tapout/cmd_public_key.h)\n" + pub)
+    print("\nNext:\n"
+          "  1. commit tapout/cmd_public_key.h and cut a release -- commands only work on firmware\n"
+          "     built with this public key (the placeholder keeps the channel off)\n"
+          "  2. tapout provision --device http://<device-ip>    # sets the command topic")
+    return 0
+
+
+def cmd_provision(args, cfg):
+    require(cfg, "cmd_url")
+    user = args.user
+    pw = os.environ.get("TAPOUT_WEB_PASS") or getpass.getpass(f"web admin password for '{user}': ")
+    fields = {"ntfy_cmd": cfg["cmd_url"]}
+    if args.interval:
+        fields["cmd_interval"] = str(args.interval)
+    if not args.no_reboot:
+        fields["reboot"] = "1"
+    url = args.device.rstrip("/") + "/provision"
+    auth = base64.b64encode(f"{user}:{pw}".encode()).decode()
+    print(f"POST {url} (ntfy_cmd{', cmd_interval' if args.interval else ''}"
+          f"{', reboot=1' if not args.no_reboot else ''}) -- no secrets are sent")
+    print("  note: /provision itself is plain HTTP basic auth -- run this from a trusted network.")
+    try:
+        status, body = http("POST", url, data=urllib.parse.urlencode(fields).encode(),
+                            headers={"Authorization": f"Basic {auth}",
+                                     "Content-Type": "application/x-www-form-urlencoded"})
+    except urllib.error.HTTPError as e:
+        die(f"device refused: HTTP {e.code} {e.read().decode(errors='replace').strip()}")
+    except (urllib.error.URLError, OSError) as e:
+        die(f"could not reach the device: {e}")
+    print(f"  device: HTTP {status} {body.strip()}")
+    if not args.no_reboot:
+        print("device is rebooting; give it ~30s, then run `tapout ping`.")
+    return 0
+
+
+def cmd_ring_mode(args, cfg):
+    if not args.mode and not args.min_ms:
+        die("give a mode (single|pattern) and/or --min-ms; `tapout ping` shows the current setting")
+    if args.min_ms and not 100 <= args.min_ms <= 1500:
+        die("--min-ms must be 100-1500 (a normal ring is ~2 s)")
+    if args.min_ms and args.min_ms > 1000:
+        confirm_typed(args, f"A {args.min_ms} ms threshold means a ring cut short by a transfer to "
+                            "dispatch may NOT page.", "yes")
+    if args.mode == "pattern":
+        confirm_typed(args, "PATTERN mode pages only on the 2nd ring. If the station line rings only "
+                            "once before rolling to dispatch, that call will NOT page.", "yes")
+    return send(args, cfg, "ring-mode", which=args.mode, minutes=args.min_ms)
+
+
+def cmd_watch(args, cfg):
+    require(cfg, "status_url")
+    since = args.since
+    print(f"tailing {cfg['status_url']} (since {since}); Ctrl-C to stop")
+    seen = set()
+    try:
+        while True:
+            for m in poll_status(cfg["status_url"], since):
+                if m["id"] in seen:
+                    continue
+                seen.add(m["id"])
+                ts = time.strftime("%H:%M:%S", time.localtime(m.get("time", 0)))
+                print(f"[{ts}] {m.get('title', '')}: {m.get('message', '')}")
+            since = int(time.time()) - 60
+            time.sleep(5)
+    except KeyboardInterrupt:
+        return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="tapout", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--no-wait", action="store_true", help="don't wait for the device's STATUS ack")
+    ap.add_argument("--timeout", type=int, help="seconds to wait for the ack (default 150)")
+    ap.add_argument("--dry-run", action="store_true", help="print the signed command; send nothing")
+    ap.add_argument("-y", "--yes", action="store_true", help="skip the crew-channel confirmation prompt")
+    sub = ap.add_subparsers(dest="action", required=True, metavar="COMMAND")
+
+    def to_arg(p, default="status", choices=("status", "call")):
+        p.add_argument("--to", default=default, choices=choices,
+                       help=f"where the device posts it (default {default}; 'call' = the CREW alert topic)")
+
+    p = sub.add_parser("init", help="generate a command topic + key into the config file")
+    p.add_argument("--status-url", help="your STATUS topic URL (where the device acks commands)")
+    p.add_argument("--cmd-topic", help="command topic name or full URL (default: random)")
+    p.add_argument("--server", default="https://ntfy.sh")
+    p.add_argument("--force", action="store_true", help="replace an existing key pair")
+    p.add_argument("--header", help="where to write the public-key header (default: <repo>/tapout/cmd_public_key.h)")
+
+    p = sub.add_parser("provision", help="push the command topic + key to the device over POST /provision")
+    p.add_argument("--device", required=True, help="e.g. http://10.0.0.7 (the device's LAN address)")
+    p.add_argument("--user", default="crew")
+    p.add_argument("--interval", type=int, help="poll interval seconds (15-3600, device default 30)")
+    p.add_argument("--no-reboot", action="store_true", help="don't reboot (settings apply at next boot)")
+
+    sub.add_parser("ping", help="device replies on STATUS with version/uptime/health")
+
+    def url_arg(p):
+        p.add_argument("--url", help="send to this other ntfy topic instead (full https URL or "
+                                     "topic name); the crew/command topics are refused here")
+
+    p = sub.add_parser("test", help="send a [TEST] notification to STATUS (or --url)")
+    url_arg(p)
+    p.add_argument("-m", "--message", help="custom body")
+
+    p = sub.add_parser("announce", aliases=["send"], help="send a custom message to STATUS (or --url)")
+    url_arg(p)
+    p.add_argument("-m", "--message", required=True)
+    p.add_argument("-t", "--title", help="title")
+    p.add_argument("-p", "--priority", choices=PRIORITIES, default="default")
+
+    p = sub.add_parser("maint", help="open/close a maintenance window")
+    msub = p.add_subparsers(dest="maint_action", required=True, metavar="start|end")
+    ps = msub.add_parser("start", help="announce a maintenance window on STATUS (auto-closes at the end)")
+    ps.add_argument("--minutes", type=int, default=30, help="window length, 1-720 (default 30)")
+    ps.add_argument("-m", "--message", help="extra note appended to the announcement")
+    pe = msub.add_parser("end", help="close the window early with a 'resuming normal operations' notice")
+    pe.add_argument("-m", "--message", help="extra note")
+
+    p = sub.add_parser("sim-ring", help="run the real ring pipeline as a simulation")
+    to_arg(p)   # --to call: the standard alert, [TEST]-labelled, to the crew -- the only crew-bound command
+
+    p = sub.add_parser("set-topic", help="change one of the device's ntfy topics (verified first)")
+    p.add_argument("which", choices=("call", "status", "cmd"))
+    p.add_argument("url", help="full https URL or topic name on ntfy.sh")
+    p = sub.add_parser("revert-topic", help="swap a topic back to its value before the last set-topic")
+    p.add_argument("which", choices=("call", "status", "cmd"))
+    p = sub.add_parser("confirm-topic", help="activate a STAGED crew-topic change (after set/revert-topic call)")
+    p.add_argument("which", choices=("call",))
+    p.add_argument("--code", help="confirm code from the STAGED ack (default: remembered by set-topic)")
+
+    p = sub.add_parser("ring-mode", help="single = page on the 1st ring (default); pattern = only on 2 rings")
+    p.add_argument("mode", nargs="?", choices=("single", "pattern"))
+    p.add_argument("--min-ms", type=int, help="single mode: page once a ring lasts this long (100-1500, default 500)")
+
+    sub.add_parser("check-ota", help="ask the device to check GitHub for a signed update now")
+    sub.add_parser("reboot", help="reboot the device")
+
+    p = sub.add_parser("watch", help="tail the STATUS topic")
+    p.add_argument("--since", default="10m", help="ntfy since= value (default 10m)")
+
+    args = ap.parse_args(argv)
+    cfg = load_config()
+    a = args.action
+
+    if a == "init":
+        return cmd_init(args, cfg)
+    if a == "provision":
+        return cmd_provision(args, cfg)
+    if a == "watch":
+        return cmd_watch(args, cfg)
+    if a == "ping":
+        return send(args, cfg, "ping", to="status")
+    url, to = None, "status"
+    if a in ("test", "announce", "send") and args.url:
+        to, url = "url", ntfy_url(args.url)
+    if a == "test":
+        return send(args, cfg, "test", to=to, body=args.message, url=url)
+    if a in ("announce", "send"):
+        return send(args, cfg, "announce", to=to, body=args.message,
+                    title=args.title, priority=args.priority, url=url)
+    if a in ("set-topic", "revert-topic"):
+        return cmd_set_topic(args, cfg, revert=(a == "revert-topic"))
+    if a == "confirm-topic":
+        return cmd_confirm_topic(args, cfg)
+    if a == "maint":
+        if args.maint_action == "start":
+            if not 1 <= args.minutes <= 720:
+                die("--minutes must be 1-720")
+            return send(args, cfg, "maint-start", to="status", minutes=args.minutes, body=args.message)
+        return send(args, cfg, "maint-end", to="status", body=args.message)
+    if a == "sim-ring":
+        confirm_crew(args, "a [TEST] STATION PHONE RINGING page at MAX priority")
+        return send(args, cfg, "sim-ring", to=args.to)
+    if a == "ring-mode":
+        return cmd_ring_mode(args, cfg)
+    if a == "check-ota":
+        return send(args, cfg, "check-ota", to="status")
+    if a == "reboot":
+        return send(args, cfg, "reboot", to="status")
+    ap.error(f"unknown command {a}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

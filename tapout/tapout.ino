@@ -53,6 +53,13 @@
  *   - Dead-man's-switch: optional pull-based check-in to an external uptime
  *     monitor, WITHHELD when the device is degraded, so silence becomes the
  *     alarm; plus a machine-checkable "healthy" verdict + "faults" list in JSON
+ *   - v2.1.0 remote command channel: ECDSA-P256-signed commands (operator's
+ *     private key; device holds only the public key, cmd_public_key.h -- same
+ *     model as signed OTA) polled from a private ntfy topic (ping / test / send /
+ *     maintenance window / ring-mode / topics / sim-ring / check-ota / reboot),
+ *     driven by the tools/tapout CLI. Inert until a real public key is compiled
+ *     in AND ntfy_cmd is provisioned; STATUS-only unless a signed command
+ *     explicitly targets the crew CALL topic.
  *
  * NETWORK / FIREWALL (the IoT VLAN -- currently ONLY outbound TCP 443 to
  * ntfy.sh is allowed). Each optional feature degrades gracefully if its port
@@ -98,6 +105,8 @@
 #include <esp_app_desc.h>   // esp_app_get_elf_sha256: which build a crash dump came from
 #include <stdarg.h>
 #include "public_key.h"     // RSA-2048 signing public key (RAIL A) -- committed, not secret
+#include "cmd_proto.h"     // remote-command wire format: parse + ECDSA-P256 verify
+#include "cmd_public_key.h" // operator's command-signing PUBLIC key -- committed, not secret
 #include "ring_detect.h"    // ring-PATTERN detector (rejects boot/replug/brownout blips)
 
 // ======================= USER CONFIG -- SECRET-FREE DEFAULTS =============
@@ -151,6 +160,17 @@ static inline uint32_t clampOtaInterval(uint32_t v) {
   return v;
 }
 
+// Remote-command poll interval bounds (seconds). Each poll is one bounded TLS GET
+// to ntfy.sh; the floor keeps a 0/garbage NVS value from polling every loop pass
+// (and from tripping ntfy's per-IP rate limit).
+static const uint32_t CMD_INTERVAL_MIN_S = 15;
+static const uint32_t CMD_INTERVAL_MAX_S = 3600;
+static inline uint32_t clampCmdInterval(uint32_t v) {
+  if (v < CMD_INTERVAL_MIN_S) return CMD_INTERVAL_MIN_S;
+  if (v > CMD_INTERVAL_MAX_S) return CMD_INTERVAL_MAX_S;
+  return v;
+}
+
 // Single-mode ring threshold bounds: below ~100 ms is glitch territory. The
 // ceiling stays well under a normal ~2 s US ring: at >= ~2 s every ring would end
 // before reaching the threshold and NO call would ever page.
@@ -172,6 +192,9 @@ struct Cfg {
   uint8_t  ringMode;       // RD_MODE_SINGLE (default: page on the 1st ring) | RD_MODE_PATTERN
   uint32_t ringMinMs;      // single mode: page once a ring has lasted this long
   bool     provisioned;
+  // Remote-command channel (v2.1.0). Both blank => feature fully inert.
+  String   ntfyCmd;        // private ntfy topic URL the device POLLS for signed commands
+  uint32_t cmdIntervalS;   // poll interval, seconds
 } C;
 
 // Forward decl: the placeholder/blank-credential gate, defined in SECURITY HELPERS.
@@ -201,6 +224,8 @@ static void loadConfig() {
   // by an older build or a hand-edited namespace, not just the write path.
   C.otaIntervalMin = clampOtaInterval(cfg.getUInt("ota_interval", 360));  // 6 h default
   C.provisioned    = cfg.getBool("provisioned", false);
+  C.ntfyCmd        = cfg.getString("ntfy_cmd", "");      // "" => command channel OFF
+  C.cmdIntervalS   = clampCmdInterval(cfg.getUInt("cmd_interval", 30));
   C.ringMode       = cfg.getUChar("ring_mode", RD_MODE_SINGLE) == RD_MODE_PATTERN ? RD_MODE_PATTERN : RD_MODE_SINGLE;
   C.ringMinMs      = clampRingMinMs(cfg.getUInt("ring_min_ms", RD_SINGLE_MIN_DEFAULT_MS));
   cfg.end();
@@ -268,6 +293,16 @@ static const uint32_t HEAP_CHECK_MS      = 10UL * 60UL * 1000UL;  // every 10 mi
 // pill, and the dead-man's-switch health gate.
 static const uint32_t TLS_MIN_CONTIG_BLOCK = 16000;
 
+// Remote commands (see REMOTE COMMAND CHANNEL below + tools/tapout).
+static const uint32_t CMD_FRESH_MS        = 5UL * 60UL * 1000UL;  // accept only commands signed within +/-5 min
+static const uint8_t  CMD_MAX_PER_POLL    = 4;                    // commands executed per poll (rest wait for the next)
+static const size_t   CMD_POLL_MAX_BYTES  = 16384;                // cap on one poll response (spam guard)
+static const uint32_t CMD_POLL_MAX_MS     = 8000;                 // cap on reading one poll response
+static const uint32_t CMD_REJECT_PING_MS  = 10UL * 60UL * 1000UL; // throttle "bad signature" STATUS pings
+static const uint32_t MAINT_DEFAULT_MIN   = 30;
+static const uint32_t MAINT_MAX_MIN       = 720;                  // 12 h ceiling on one window
+static const uint32_t MAINT_END_RETRY_MS  = 60UL * 1000UL;        // retry the auto-end announcement
+
 // Clock "is it real?" floor (~2023-11-14). Below this => not synced.
 static const time_t   TIME_VALID_EPOCH  = 1700000000;
 
@@ -276,7 +311,7 @@ static const uint8_t  RINGLOG_N         = 20;          // events kept on flash
 static const uint8_t  RINGLOG_VERSION   = 2;           // bump if blob layout changes (v2 adds simMask)
 
 // Web identity / build stamp.
-static const char* FW_VERSION    = "2.0.10";
+static const char* FW_VERSION    = "2.1.0";
 static const char* FW_BUILD_MARK = __DATE__ " " __TIME__;
 
 // --------------------------- State --------------------------------------
@@ -471,6 +506,18 @@ static char      otaLastResult[100] = "(no OTA poll yet)";
 static uint32_t  otaLastResultMs    = 0;
 static uint32_t  lastNoUpdatePingMs = 0;     // throttles the routine "no new version" STATUS ping
 
+// ----- Remote command channel + maintenance window -----
+static uint32_t  lastCmdPollMs      = 0;
+static char      cmdSince[28]       = "6m";   // ntfy ?since= cursor: a duration at boot, then the last message id
+static uint64_t  cmdFloorMs         = 0;      // NVS: ts of the newest command ever accepted (replay floor)
+static char      cmdLastResult[112] = "(command channel not configured)";
+static uint32_t  cmdLastResultMs    = 0;
+static uint32_t  lastCmdRejectPingMs = 0;
+static bool      otaCheckNow        = false;  // one-shot: run the manifest check on the next loop pass
+static uint32_t  maintEndEpoch      = 0;      // NVS: 0 = no maintenance window active
+static bool      maintToCall        = false;  // NVS: window was announced on the CALL topic (so the end is too)
+static uint32_t  lastMaintEndTryMs  = 0;
+
 // ----- SoftAP setup portal (fresh, unprovisioned units) -----
 static DNSServer dns;
 static bool      inSetupMode = false;        // true => SoftAP captive portal, no STA
@@ -563,6 +610,14 @@ static void otaCheckManifest();
 static bool otaDownloadAndFlash(const String& url, size_t totalSize);
 static bool otaEnabledAndSafe();
 static bool otaSafeToStart();
+// ---- v2.1.0: remote commands + maintenance window ----
+static bool cmdChannelEnabled();
+static void loadCmdState();
+static void serviceCommands();
+static void serviceMaint();
+static bool maintActive();
+static bool sameTopic(const String& a, const String& b);
+static void fmtClock(uint32_t epoch, char* out, size_t n);
 
 // ===================== SECURITY HELPERS ================================
 // A credential still set to its shipped CHANGE-ME placeholder (or left blank)
@@ -1135,6 +1190,11 @@ static void handleRoot() {
   else                                   server.sendContent(F("<span class='pill ok'>Idle -- armed</span>"));
   if (callPending)                       server.sendContent(F(" <span class='pill warn'>CALL alert retrying</span>"));
   if (!timeSynced())                     server.sendContent(F(" <span class='pill warn'>NTP not synced</span>"));
+  if (maintActive()) {
+    char until[24]; fmtClock(maintEndEpoch, until, sizeof(until));
+    server.sendContent(String(F(" <span class='pill warn'>MAINTENANCE until ")) + until
+                       + (maintToCall ? F(" (crew notified)") : F(" (STATUS only)")) + F("</span>"));
+  }
   server.sendContent(F("</div>"));
 
   // main table
@@ -1177,6 +1237,9 @@ static void handleRoot() {
                           F(" ago, next in ") + fmtDuration(until));
   }
   row(F("Firmware build"), String(FW_BUILD_MARK));
+  row(F("Remote commands"), cmdChannelEnabled()
+      ? String(F("enabled, every ")) + C.cmdIntervalS + F(" s &mdash; ") + cmdLastResult
+      : String(F("not configured")));
   server.sendContent(F("</table></div>"));
 
   // recent ring log (persistent, newest first) -- streamed one entry at a time
@@ -1314,6 +1377,15 @@ static void handleStatusJson() {
       server.sendContent(F(",\"running_image_version\":\"\""));
   }
 
+  // ---- Remote command channel + maintenance window (no topic URL / key) ----
+  server.sendContent(String(F(",\"cmd_enabled\":")) + (cmdChannelEnabled() ? "true" : "false"));
+  server.sendContent(String(F(",\"cmd_key_installed\":")) + (cmdKeyInstalled() ? "true" : "false"));
+  server.sendContent(String(F(",\"cmd_interval_s\":")) + String((unsigned long)C.cmdIntervalS));
+  server.sendContent(String(F(",\"cmd_last_result\":\"")) + cmdLastResult + "\"");
+  server.sendContent(String(F(",\"cmd_last_result_ms_ago\":")) + String(cmdLastResultMs ? (now - cmdLastResultMs) : 0));
+  server.sendContent(String(F(",\"maint_active\":")) + (maintActive() ? "true" : "false"));
+  server.sendContent(String(F(",\"maint_ends_epoch\":")) + String((unsigned long)maintEndEpoch));
+  server.sendContent(String(F(",\"maint_channel\":\"")) + (maintActive() ? (maintToCall ? "call" : "status") : "") + "\"");
   // Ring-pattern detector: armed yet? how much non-ring activity was ignored?
   {
     uint32_t ign, gl, lastIgn, lastLen; BurstRec bl[BURSTLOG_N]; uint8_t bc, bh;
@@ -1488,6 +1560,8 @@ static void provisionFromArgs() {
   // Clamp to a sane floor/ceiling: toInt() yields 0 for blank/non-numeric input,
   // which would make the loop scheduler run otaCheckManifest() every pass.
   if (server.hasArg("ota_interval")) cfg.putUInt("ota_interval", clampOtaInterval((uint32_t)server.arg("ota_interval").toInt()));
+  if (server.hasArg("ntfy_cmd"))     saveField("ntfy_cmd",     server.arg("ntfy_cmd"));
+  if (server.hasArg("cmd_interval")) cfg.putUInt("cmd_interval", clampCmdInterval((uint32_t)server.arg("cmd_interval").toInt()));
   if (server.hasArg("ring_mode")) {           // "single" (default) | "pattern"
     C.ringMode = server.arg("ring_mode") == "pattern" ? RD_MODE_PATTERN : RD_MODE_SINGLE;
     cfg.putUChar("ring_mode", C.ringMode);
@@ -1534,6 +1608,7 @@ static void handleSetupForm() {
     "<label>OTA manifest url (optional)</label><input name='ota_manifest' placeholder='https://raw.githubusercontent.com/...'>"
     "<label>Enable auto pull-OTA? (1=yes,0=no)</label><input name='ota_enabled' value='0'>"
     "<label>OTA check interval (minutes)</label><input name='ota_interval' value='360'>"
+    "<label>Command topic url (optional, private; for tools/tapout)</label><input name='ntfy_cmd' placeholder='https://ntfy.sh/...'>"
     "<label>Ring mode: single = page on the 1st ring (default), pattern = only on a 2-ring pattern</label>"
     "<input name='ring_mode' value='single'>"
     "<button type='submit'>Save &amp; reboot</button></form>"
@@ -1974,7 +2049,7 @@ static void handleCheckOta() {
             && !justRang && wifi && heapOk && imgValid;
   bool newer = mver.length() && semver(mver) > semver(FW_VERSION);
   bool wouldUpdate = gates && newer && murl.length() && msz;
-  if (wouldUpdate) lastOtaCheckMs = 0;    // scheduler fires otaCheckManifest -> download next loop
+  if (wouldUpdate) otaCheckNow = true;    // scheduler fires otaCheckManifest -> download next loop
 
   // Confirm the MANUAL check on the STATUS thread (user-initiated, so not spammy).
   // Ping ONLY when the manual check actually finds a new version (no spam on
@@ -2089,6 +2164,665 @@ static void otaServiceProbation() {
     }
     delay(200);
     esp_ota_mark_app_invalid_rollback_and_reboot();   // REVERT to previous good slot (no return)
+  }
+}
+
+// ==================== REMOTE COMMAND CHANNEL (v2.1.0) ==================
+// Lets the owner drive the deployed unit from anywhere with tools/tapout (CLI)
+// over the one path the IoT VLAN allows: outbound 443 to ntfy.sh. The device
+// POLLS a private command topic (C.ntfyCmd) every C.cmdIntervalS seconds.
+//
+// Safety rails:
+//   * Fully INERT until a real public key is compiled in (cmd_public_key.h) AND
+//     ntfy_cmd is provisioned.
+//   * Every command is ECDSA-P256 signed with the operator's PRIVATE key, which
+//     never touches the device (cmd_proto.h) -- the same asymmetric model as the
+//     signed OTA pipeline. Nothing secret is provisioned or stored here. The
+//     signature covers the destination, so nothing can be re-routed to the crew.
+//   * Freshness: rejected unless signed within +/-CMD_FRESH_MS of device time
+//     (requires NTP). Replay: rejected unless its ts is newer than every command
+//     ever accepted (floor persisted to NVS BEFORE executing, so a `reboot`
+//     command can never re-run itself after the reboot).
+//   * Output goes to the STATUS topic (the log channel). The crew CALL topic only
+//     ever carries the standard ring alert: sendNtfy() refuses it unless called
+//     from fireCallAlert(), and the only crew-bound command is `sim-ring --to call`
+//     (the standard alert, [TEST]-labelled, through that same function).
+//   * Never polls while a call is latched/ringing/just rang, on OTA probation,
+//     or mid-OTA; the real ring path always wins. A real ring is never altered
+//     or suppressed by maintenance mode.
+
+static Preferences cmdPrefs;               // NVS namespace "fhacmd"
+
+static void cmdNote(const char* msg) {
+  strncpy(cmdLastResult, msg, sizeof(cmdLastResult) - 1);
+  cmdLastResult[sizeof(cmdLastResult) - 1] = 0;
+  cmdLastResultMs = millis();
+  Serial.printf("[cmd] %s\n", msg);
+}
+
+// A real operator public key is compiled in (the shipped placeholder keeps the
+// command channel off, exactly like public_key.h gates OTA).
+static bool cmdKeyInstalled() {
+  return strstr(CMD_PUBLIC_KEY, "BEGIN PUBLIC KEY") && !looksLikePlaceholder(CMD_PUBLIC_KEY);
+}
+
+static bool cmdChannelEnabled() {
+  return isProvisioned()
+      && C.ntfyCmd.startsWith("https://")
+      && !looksLikePlaceholder(C.ntfyCmd.c_str())
+      && cmdKeyInstalled()
+      && !sameTopic(C.ntfyCmd, C.ntfyCall)  // never treat the crew topic as a command inbox
+      && !sameTopic(C.ntfyCmd, C.ntfyStatus);
+}
+
+// Returns false if the NVS commit failed. The replay floor MUST be durable before a
+// command runs (else a `reboot` could re-run itself after the reboot), so callers
+// fail closed on false.
+static bool persistCmdState() {
+  cmdPrefs.begin("fhacmd", false);
+  bool ok = cmdPrefs.putULong64("floor", cmdFloorMs) == sizeof(uint64_t);
+  cmdPrefs.putUInt("m_end", maintEndEpoch);
+  cmdPrefs.putBool("m_call", maintToCall);
+  cmdPrefs.end();
+  esp_task_wdt_reset();
+  return ok;
+}
+
+static void loadCmdState() {
+  cmdPrefs.begin("fhacmd", true);
+  cmdFloorMs    = cmdPrefs.getULong64("floor", 0);
+  maintEndEpoch = cmdPrefs.getUInt("m_end", 0);
+  maintToCall   = cmdPrefs.getBool("m_call", false);
+  cmdPrefs.end();
+  if (cmdChannelEnabled()) cmdNote("enabled; waiting for first poll");
+}
+
+static bool maintActive() { return maintEndEpoch != 0; }
+
+// "14:30 EDT" for an absolute epoch (maintenance messages).
+static void fmtClock(uint32_t epoch, char* out, size_t n) {
+  time_t t = (time_t)epoch;
+  struct tm lt;
+  localtime_r(&t, &lt);
+  strftime(out, n, "%H:%M %Z", &lt);
+}
+
+// STATUS acknowledgement; the CLI matches on "[id <id>]".
+static void cmdAck(const CmdMsg& m, bool ok, const char* detail) {
+  char title[48];
+  snprintf(title, sizeof(title), "Tapout cmd %s: %s", ok ? "OK" : "FAILED", m.c);
+  char body[360];
+  snprintf(body, sizeof(body), "%s [id %s]", detail, m.id);
+  char note[112];
+  snprintf(note, sizeof(note), "%s %s: %.80s", m.c, ok ? "ok" : "FAILED", detail);
+  cmdNote(note);
+  logStatus(title, body, ok ? "low" : "default", ok ? "robot" : "robot,warning");   // a log: queued if offline
+}
+
+// Crew CALL topic ONLY on an explicit, signed to=call.
+static bool cmdWantsCall(const CmdMsg& m) { return strcmp(m.to, "call") == 0; }
+static bool cmdToValid(const CmdMsg& m) {
+  return m.to[0] == 0 || !strcmp(m.to, "status") || !strcmp(m.to, "call") || !strcmp(m.to, "auto")
+      || !strcmp(m.to, "url");
+}
+
+// URL shape + comparison live in cmd_proto.h (host-testable); thin String wrappers.
+static bool urlLooksOk(const char* u) { return cmdUrlLooksOk(u) && !looksLikePlaceholder(u); }
+static bool sameTopic(const String& a, const String& b) { return cmdSameTopic(a.c_str(), b.c_str()); }
+
+// "https://ntfy.sh/pcfd...lert": enough to recognise in a STATUS ack, not enough
+// for a STATUS reader to subscribe to the crew topic.
+static String maskUrl(const String& u) {
+  int slash = u.lastIndexOf('/');
+  if (slash < 0) return String("...");
+  String t = u.substring(slash + 1);
+  if (t.length() <= 8) return u.substring(0, slash + 1) + "...";
+  return u.substring(0, slash + 1) + t.substring(0, 4) + "..." + t.substring(t.length() - 4);
+}
+
+// set-topic / revert-topic plumbing: which live field, its NVS key, and the
+// NVS key holding the value it replaced (for revert-topic).
+static String* topicRef(const char* w) {
+  if (!strcmp(w, "call"))   return &C.ntfyCall;
+  if (!strcmp(w, "status")) return &C.ntfyStatus;
+  if (!strcmp(w, "cmd"))    return &C.ntfyCmd;
+  return nullptr;
+}
+static const char* topicNvsKey(const char* w) {
+  return !strcmp(w, "call") ? "ntfy_call" : !strcmp(w, "status") ? "ntfy_status" : "ntfy_cmd";
+}
+static const char* topicPrevKey(const char* w) {
+  return !strcmp(w, "call") ? "prev_call" : !strcmp(w, "status") ? "prev_status" : "prev_cmd";
+}
+
+// Staged CREW-topic change awaiting `confirm-topic call` (RAM only; a reboot
+// simply cancels it, which is the safe direction).
+static char     pendCallUrl[sizeof(((CmdMsg*)0)->u)] = "";
+static char     pendCallCode[8] = "";   // random code the confirm must echo (binds it to THIS staging)
+static uint32_t pendCallMs = 0;
+static const uint32_t TOPIC_CONFIRM_WINDOW_MS = 30UL * 60UL * 1000UL;
+
+// Write newUrl as topic `w` (keeping the old value as prev_<w>) and make it live.
+// Returns false (nothing changed) if the NVS commit fails.
+static bool commitTopic(const char* w, const String& nu) {
+  String* cur = topicRef(w);
+  cfg.begin("fhacfg", false);
+  cfg.putString(topicPrevKey(w), *cur);
+  bool ok = cfg.putString(topicNvsKey(w), nu) == nu.length();
+  cfg.end();
+  esp_task_wdt_reset();
+  if (!ok) return false;
+  *cur = nu;
+  if (!strcmp(w, "cmd")) strcpy(cmdSince, "6m");   // new inbox: fresh cursor (replay floor still applies)
+  return true;
+}
+
+// Validate a proposed topic change; returns an error string or nullptr.
+static const char* topicChangeError(const char* w, const String& nu) {
+  if (!topicRef(w)) return "which topic? use call|status|cmd";
+  if (!urlLooksOk(nu.c_str())) return "URL must be exactly https://<host>/<topic> (topic: letters, digits, - _)";
+  if ((strcmp(w, "call")   && sameTopic(nu, C.ntfyCall)) ||
+      (strcmp(w, "status") && sameTopic(nu, C.ntfyStatus)) ||
+      (strcmp(w, "cmd")    && sameTopic(nu, C.ntfyCmd)))
+    return "that URL is already another Tapout topic; CALL/STATUS/command topics must stay distinct";
+  return nullptr;
+}
+
+// set-topic / revert-topic.
+//  * call:   STAGED only. Sends a [TEST] channel check to the new URL and waits
+//            for `confirm-topic call` (after a human confirms the crew got it).
+//            ntfy accepts a POST to ANY topic name, so a successful send can't
+//            prove anyone is listening -- a typo must not silently cut the crew off.
+//  * status: channel check to the new URL, then switch. The ack goes out BEFORE
+//            the switch, i.e. on the OLD status topic where the CLI is waiting.
+//  * cmd:    test-poll the new inbox, then switch (so we can't go deaf).
+static void applyTopic(const CmdMsg& m, const char* w, const char* newUrl) {
+  char d[320];
+  String nu(newUrl);
+  const char* err = topicChangeError(w, nu);
+  if (err) { cmdAck(m, false, err); return; }
+  String* cur = topicRef(w);
+  if (sameTopic(nu, *cur)) { cmdAck(m, true, "that is already the current URL; nothing to do"); return; }
+
+  if (!strcmp(w, "call")) {
+    // The check is the standard alert, [TEST]-labelled (same as `sim-ring --to call`):
+    // a crew channel only ever carries the standard ring alert framework.
+    char ts[48], body[96];
+    formatTimestamp(ts, sizeof(ts));
+    snprintf(body, sizeof(body), "Incoming call on the station line at %s.", ts);
+    bool ok = sendNtfy(nu.c_str(), "[TEST] STATION PHONE RINGING", body, "max", "test_tube,rotating_light");
+    if (!ok) { cmdAck(m, false, "[TEST] alert to the new URL FAILED; nothing changed"); return; }
+    strncpy(pendCallUrl, nu.c_str(), sizeof(pendCallUrl) - 1);
+    pendCallUrl[sizeof(pendCallUrl) - 1] = 0;
+    snprintf(pendCallCode, sizeof(pendCallCode), "%06lx", (unsigned long)(esp_random() & 0xFFFFFFUL));
+    pendCallMs = millis();
+    snprintf(d, sizeof(d), "crew topic change STAGED, not active: [TEST] alert delivered to %s. "
+             "Once the crew confirm they got it, run `tapout confirm-topic call` within 30 min "
+             "(confirm code %s). Real alerts still go to %s.",
+             maskUrl(nu).c_str(), pendCallCode, maskUrl(*cur).c_str());
+    cmdAck(m, true, d);
+    return;
+  }
+
+  if (!strcmp(w, "status")) {
+    bool ok = sendNtfy(nu.c_str(), "[TEST] Tapout channel check",
+      "Channel check: this topic is now Tapout's STATUS / monitoring channel. Test only.",
+      "default", "test_tube");
+    if (!ok) { cmdAck(m, false, "channel check to the new URL FAILED; nothing changed"); return; }
+  } else if (!httpGetBounded((nu + "/json?poll=1&since=1s").c_str())) {
+    cmdAck(m, false, "test poll of the new command topic FAILED; nothing changed");
+    return;
+  }
+  String old = *cur;
+  snprintf(d, sizeof(d), "%s topic changed %s -> %s. Undo: tapout revert-topic %s",
+           w, maskUrl(old).c_str(), maskUrl(nu).c_str(), w);
+  // Ack first (still on the old STATUS topic), then commit. If the commit fails,
+  // say so on the old topic too, so the CLI never believes a switch that didn't happen.
+  String saved = C.ntfyStatus;
+  if (!commitTopic(w, nu)) { cmdAck(m, false, "NVS write FAILED; topic unchanged"); return; }
+  if (!strcmp(w, "status")) {                // ack on the OLD status topic
+    String now = C.ntfyStatus; C.ntfyStatus = saved; cmdAck(m, true, d); C.ntfyStatus = now;
+  } else {
+    cmdAck(m, true, d);
+  }
+}
+
+// confirm-topic call: activate a staged crew-topic change. The signed command must
+// echo the random code from the staging ack (b=<code>; the CLI remembers it), so a
+// confirm can only ever activate the change the operator actually saw staged.
+static void confirmCallTopic(const CmdMsg& m) {
+  char d[320];
+  if (strcmp(m.w, "call") != 0) { cmdAck(m, false, "only the call topic needs confirm-topic"); return; }
+  if (!pendCallUrl[0] || millis() - pendCallMs > TOPIC_CONFIRM_WINDOW_MS) {
+    pendCallUrl[0] = 0;
+    cmdAck(m, false, "no staged crew-topic change (none, expired after 30 min, or device rebooted); "
+                     "run set-topic call again");
+    return;
+  }
+  String nu(pendCallUrl);
+  if (strcmp(m.b, pendCallCode) != 0) { cmdAck(m, false, "confirm code does not match the staged change; nothing changed"); return; }
+  const char* err = topicChangeError("call", nu);
+  if (err) { cmdAck(m, false, err); return; }
+  String old = C.ntfyCall;
+  if (!commitTopic("call", nu)) { cmdAck(m, false, "NVS write FAILED; crew topic unchanged"); return; }
+  pendCallUrl[0] = 0;
+  pendCallCode[0] = 0;
+  // No notice is posted on the old crew topic: crew channels only ever carry the
+  // standard ring alert. Tell subscribers to move over through your own channels.
+  snprintf(d, sizeof(d), "call topic changed %s -> %s. Nothing was posted on the old topic -- tell anyone "
+           "subscribed there to switch. Undo: tapout revert-topic call", maskUrl(old).c_str(), maskUrl(nu).c_str());
+  cmdAck(m, true, d);
+}
+
+static const char* chanName(bool call) { return call ? "CALL (crew)" : "STATUS"; }
+
+static bool sendMaintEnd(bool toCall, const char* body) {
+  (void)toCall;                              // crew channel = standard alert only: always STATUS
+  return logStatus("Maintenance complete: station phone alerter", body,
+                  "default", "white_check_mark");
+}
+
+// --url target guard: never the crew topic (standard alert only) or our own inbox.
+static const char* urlTargetError(const char* u) {
+  if (!urlLooksOk(u)) return "URL must be exactly https://<host>/<topic> (topic: letters, digits, - _)";
+  if (sameTopic(String(u), C.ntfyCall)) return "that URL is the CREW topic, which only carries the standard ring alert";
+  if (sameTopic(String(u), C.ntfyCmd))  return "that URL is the command topic; not posting there";
+  return nullptr;
+}
+
+static void cmdExecute(const CmdMsg& m) {
+  char d[300];
+  const bool toCall = cmdWantsCall(m);
+  const bool toUrl  = !strcmp(m.to, "url");
+  const char* url = toCall ? C.ntfyCall.c_str() : C.ntfyStatus.c_str();
+
+  if (!cmdToValid(m)) { cmdAck(m, false, "invalid 'to' (use status|call)"); return; }
+  if (toCall && strcmp(m.c, "sim-ring") != 0) {
+    cmdAck(m, false, "the crew channel only ever carries the standard ring alert; this goes to STATUS "
+                     "(omit --to call). Use `sim-ring --to call` to test the crew alert itself.");
+    return;
+  }
+  if (toUrl && strcmp(m.c, "test") && strcmp(m.c, "announce")) {
+    cmdAck(m, false, "--url is only supported by test and send/announce");
+    return;
+  }
+
+  if (!strcmp(m.c, "ping")) {
+    uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    char until[24] = "off";
+    if (maintActive()) fmtClock(maintEndEpoch, until, sizeof(until));
+    snprintf(d, sizeof(d),
+      "pong: fw %s, up %s, RSSI %d dBm, heap %u B (largest %u B), rings since boot %lu, "
+      "real calls lifetime %lu, ring mode %s (%lu ms), detector %s, maintenance %s%s, OTA: %s",
+      FW_VERSION, fmtDuration(millis()).c_str(), WiFi.RSSI(), (unsigned)ESP.getFreeHeap(),
+      (unsigned)largest, (unsigned long)ringCount, (unsigned long)realCallsDelivered,
+      C.ringMode == RD_MODE_PATTERN ? "pattern" : "single", (unsigned long)C.ringMinMs,
+      ringDet.armed ? "armed" : "NOT ARMED",
+      maintActive() ? "until " : "", until, otaLastResult);
+    cmdAck(m, true, d);
+
+  } else if (!strcmp(m.c, "test")) {
+    const char* body = m.b[0] ? m.b : "Test notification from the Tapout CLI. No action needed.";
+    if (toUrl) {                              // test an arbitrary ntfy topic
+      const char* err = urlTargetError(m.u);
+      if (err) { cmdAck(m, false, err); return; }
+      bool ok = sendNtfy(m.u, "[TEST] Tapout test notification", body, "default", "test_tube");
+      snprintf(d, sizeof(d), "test notification %s on %s", ok ? "delivered" : "FAILED to send",
+               maskUrl(String(m.u)).c_str());
+      cmdAck(m, ok, d);
+      return;
+    }
+    bool ok = sendNtfy(url, "[TEST] Tapout test notification", body, "default", "test_tube");
+    snprintf(d, sizeof(d), "test notification %s on %s", ok ? "delivered" : "FAILED to send", chanName(toCall));
+    cmdAck(m, ok, d);
+
+  } else if (!strcmp(m.c, "set-topic")) {
+    applyTopic(m, m.w, m.u);
+
+  } else if (!strcmp(m.c, "confirm-topic")) {
+    confirmCallTopic(m);
+
+  } else if (!strcmp(m.c, "revert-topic")) {
+    if (!topicRef(m.w)) { cmdAck(m, false, "which topic? use call|status|cmd"); return; }
+    cfg.begin("fhacfg", true);
+    String prev = cfg.getString(topicPrevKey(m.w), "");
+    cfg.end();
+    if (prev.isEmpty()) { cmdAck(m, false, "no previous URL recorded for that topic"); return; }
+    applyTopic(m, m.w, prev.c_str());         // call: staged; status/cmd: swaps immediately
+
+  } else if (!strcmp(m.c, "announce")) {
+    if (!m.b[0]) { cmdAck(m, false, "announce needs a message body"); return; }
+    const char* prio = m.p[0] ? m.p : "default";
+    if (strcmp(prio, "min") && strcmp(prio, "low") && strcmp(prio, "default") && strcmp(prio, "high")) {
+      cmdAck(m, false, "priority must be min|low|default|high (max is reserved for real calls)");
+      return;
+    }
+    if (toUrl) {                              // custom message to another ntfy topic
+      const char* err = urlTargetError(m.u);
+      if (err) { cmdAck(m, false, err); return; }
+    }
+    char title[96];
+    const char* t = m.ti[0] ? m.ti : "Tapout notice";
+    if (toCall) snprintf(title, sizeof(title), "[NOTICE] %s", t);   // can never read as a real page
+    else        snprintf(title, sizeof(title), "%s", t);
+    bool ok = sendNtfy(toUrl ? m.u : url, title, m.b, prio, "loudspeaker");
+    snprintf(d, sizeof(d), "message %s on %s", ok ? "delivered" : "FAILED to send",
+             toUrl ? maskUrl(String(m.u)).c_str() : chanName(toCall));
+    cmdAck(m, ok, d);
+
+  } else if (!strcmp(m.c, "maint-start")) {
+    uint32_t mins = m.m ? m.m : MAINT_DEFAULT_MIN;
+    if (mins > MAINT_MAX_MIN) {
+      snprintf(d, sizeof(d), "window too long (%lu min > %lu max)", (unsigned long)mins, (unsigned long)MAINT_MAX_MIN);
+      cmdAck(m, false, d);
+      return;
+    }
+    // Re-opening over an active crew-announced window keeps the crew on the end
+    // notice: they were told a window started, so they must hear it end.
+    const bool crewAlreadyTold = false;      // maintenance notices never go to the crew channel
+    maintEndEpoch = (uint32_t)time(nullptr) + mins * 60UL;
+    maintToCall   = toCall || crewAlreadyTold;
+    lastMaintEndTryMs = 0;
+    persistCmdState();
+    char until[24]; fmtClock(maintEndEpoch, until, sizeof(until));
+    char body[600];
+    int n = snprintf(body, sizeof(body),
+      "The station phone alerter is in maintenance for the next %lu min (until %s). "
+      "You may get test or non-emergency notifications during this window. Test alerts "
+      "are labeled [TEST]; an unlabeled STATION PHONE RINGING alert is still a real call.",
+      (unsigned long)mins, until);
+    if (m.b[0] && n > 0 && (size_t)n < sizeof(body)) snprintf(body + n, sizeof(body) - n, " Note: %s", m.b);
+    bool ok = sendNtfy(url, "Maintenance: station phone alerter", body, "default", "construction");
+    snprintf(d, sizeof(d), "maintenance window open until %s; announcement %s on %s. "
+             "It auto-closes with a 'complete' notice on %s.",
+             until, ok ? "delivered" : "FAILED to send", chanName(toCall), chanName(maintToCall));
+    cmdAck(m, ok, d);
+
+  } else if (!strcmp(m.c, "maint-end")) {
+    // to=auto (or absent) -> the channel the window was opened on.
+    const bool autoTo = (m.to[0] == 0 || !strcmp(m.to, "auto"));
+    if (!maintActive() && autoTo) {
+      cmdAck(m, true, "no maintenance window was active; nothing announced");
+      return;
+    }
+    const bool endCall = autoTo ? maintToCall : toCall;
+    char body[400];
+    int n = snprintf(body, sizeof(body),
+      "Maintenance on the station phone alerter is complete. Resuming normal operations.");
+    if (m.b[0] && n > 0 && (size_t)n < sizeof(body)) snprintf(body + n, sizeof(body) - n, " Note: %s", m.b);
+    bool ok = sendMaintEnd(endCall, body);
+    maintEndEpoch = 0;                       // closed either way; the ack reports delivery
+    persistCmdState();
+    snprintf(d, sizeof(d), "maintenance closed; 'complete' notice %s on %s",
+             ok ? "delivered" : "FAILED to send", chanName(endCall));
+    cmdAck(m, ok, d);
+
+  } else if (!strcmp(m.c, "sim-ring")) {
+    if (callPending && !callSimulated) {     // never clobber a REAL call in flight
+      cmdAck(m, false, "a real CALL alert is in flight; simulation refused");
+      return;
+    }
+    callSimToCall = toCall;
+    triggerRingPipeline(/*simulated=*/true); // same pipeline as POST /simulate-ring
+    snprintf(d, sizeof(d), "simulated ring injected -> %s%s", toCall
+             ? "CALL at MAX priority, [TEST]-labeled (crew paged)"
+             : "STATUS, [SIM]-tagged (crew not paged)",
+             callPending ? "; first send failed, retrying" : "; delivered");
+    cmdAck(m, true, d);
+
+  } else if (!strcmp(m.c, "check-ota")) {
+    if (!otaEnabledAndSafe()) {
+      snprintf(d, sizeof(d), "pull-OTA is not enabled/armed (ota_enabled=%d, manifest %s)",
+               C.otaEnabled ? 1 : 0, C.otaManifest.isEmpty() ? "unset" : "set");
+      cmdAck(m, false, d);
+      return;
+    }
+    otaCheckNow = true;
+    cmdAck(m, true, "manifest check queued for the next loop pass; watch STATUS for 'OTA update found'");
+
+  } else if (!strcmp(m.c, "ring-mode")) {
+    // w = single|pattern (optional), m = single-mode min ring ms (optional).
+    uint8_t  mode  = C.ringMode;
+    uint32_t minMs = C.ringMinMs;
+    if (m.w[0]) {
+      if (!strcmp(m.w, "single"))       mode = RD_MODE_SINGLE;
+      else if (!strcmp(m.w, "pattern")) mode = RD_MODE_PATTERN;
+      else { cmdAck(m, false, "ring mode must be single or pattern"); return; }
+    }
+    if (m.m) {
+      if (m.m < 100 || m.m > RING_MIN_MS_MAX) {   // a ~2 s ring must still reach it
+        cmdAck(m, false, "ring min must be 100-1500 ms (a normal ring is ~2 s)");
+        return;
+      }
+      minMs = m.m;
+    }
+    cfg.begin("fhacfg", false);
+    bool ok = cfg.putUInt("ring_min_ms", minMs) == 4 && cfg.putUChar("ring_mode", mode) == 1;
+    if (!ok) {                                 // best effort: don't leave a half-applied pair for next boot
+      cfg.putUInt("ring_min_ms", C.ringMinMs);
+      cfg.putUChar("ring_mode", C.ringMode);
+    }
+    cfg.end();
+    esp_task_wdt_reset();
+    if (!ok) { cmdAck(m, false, "NVS write FAILED; ring mode unchanged"); return; }
+    C.ringMode  = mode;
+    C.ringMinMs = minMs;
+    applyRingConfig();                         // live: the sampler uses it from its next tick
+    if (mode == RD_MODE_PATTERN)
+      snprintf(d, sizeof(d), "ring mode now PATTERN: pages on the 2nd ring; a call that rings only "
+               "once will NOT page");
+    else
+      snprintf(d, sizeof(d), "ring mode now SINGLE: pages once a ring lasts %lu ms (1st ring)",
+               (unsigned long)minMs);
+    cmdAck(m, true, d);
+
+  } else if (!strcmp(m.c, "reboot")) {
+    cmdAck(m, true, "rebooting in ~2s (held while a real call alert is still being delivered)");
+    strncpy(pendingRebootWhy, "remote command: tapout reboot", sizeof(pendingRebootWhy) - 1);
+    pendingRebootMs = millis() + 2000;       // replay floor is already persisted
+
+  } else {
+    snprintf(d, sizeof(d), "unknown command '%s'", m.c);
+    cmdAck(m, false, d);
+  }
+}
+
+// Authenticate, freshness/replay-check, then execute one raw command line.
+static void cmdProcess(const char* raw) {
+  static CmdMsg m;                           // static: keep ~700 B off the loop stack
+  int e = cmdParseVerify(raw, strlen(raw), CMD_PUBLIC_KEY, &m);
+  if (e != CMD_OK) {
+    char n[80]; snprintf(n, sizeof(n), "rejected message: %s", cmdErrStr(e));
+    cmdNote(n);
+    if (e == CMD_ERR_BAD_SIG && (lastCmdRejectPingMs == 0 || millis() - lastCmdRejectPingMs >= CMD_REJECT_PING_MS)) {
+      lastCmdRejectPingMs = millis();        // throttled so a spammed topic can't flood STATUS
+      logStatus("Tapout: rejected command",
+               "A message on the command topic failed signature verification and was ignored. "
+               "If you didn't send it, someone is posting to the command topic: rotate it (set-topic cmd).", "default", "warning");
+    }
+    return;
+  }
+
+  // Already accepted (or older than something accepted): silent. This is the
+  // normal case right after boot, when the ?since=6m re-fetch returns commands
+  // that already ran -- including the `reboot` that caused this boot.
+  if (m.ts <= cmdFloorMs) return;
+
+  uint64_t nowMs = (uint64_t)time(nullptr) * 1000ULL;
+  if (m.ts + CMD_FRESH_MS < nowMs) {
+    cmdFloorMs = m.ts;                       // it's in the past: safe to raise the floor
+    persistCmdState();
+    cmdAck(m, false, "expired: signed more than 5 min ago (device offline/busy?), not executed");
+    return;
+  }
+  if (m.ts > nowMs + CMD_FRESH_MS) {         // do NOT raise the floor to a future ts
+    cmdAck(m, false, "rejected: timestamp is >5 min in the future (check the sender's clock)");
+    return;
+  }
+
+  cmdFloorMs = m.ts;                         // persist BEFORE acting (reboot-safe)
+  if (!persistCmdState()) {
+    cmdAck(m, false, "NVS write of the replay floor FAILED; not executing (fail closed)");
+    return;
+  }
+  cmdExecute(m);
+}
+
+// Extract "key":"value" from one ntfy JSON line. Only plain values (no
+// backslash escapes) are taken -- command lines never need escaping.
+static bool jsonPlainStr(const char* line, const char* key, char* out, size_t cap) {
+  char pat[24];
+  snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+  const char* p = strstr(line, pat);
+  if (!p) return false;
+  p += strlen(pat);
+  size_t n = 0;
+  while (p[n] && p[n] != '"') { if (p[n] == '\\') return false; n++; }
+  if (p[n] != '"' || n + 1 > cap) return false;
+  memcpy(out, p, n);
+  out[n] = 0;
+  return true;
+}
+
+static char    cmdRaw[CMD_MAX_PER_POLL][CMD_MAX_LINE + 1];
+static uint8_t cmdRawN = 0;
+
+// One newline-terminated ntfy JSON line. `complete` = false when it overflowed
+// our buffer (we then only advance the cursor past it, from the leading "id").
+static void cmdTakeLine(const char* line, bool complete) {
+  char ev[16];
+  if (!jsonPlainStr(line, "event", ev, sizeof(ev)) || strcmp(ev, "message") != 0) return;
+  char id[sizeof(cmdSince)];
+  if (jsonPlainStr(line, "id", id, sizeof(id))) strcpy(cmdSince, id);
+  if (!complete || cmdRawN >= CMD_MAX_PER_POLL) return;
+  if (jsonPlainStr(line, "message", cmdRaw[cmdRawN], sizeof(cmdRaw[0]))
+      && !strncmp(cmdRaw[cmdRawN], "T2;", 3)) cmdRawN++;
+}
+
+// Bounded poll of the command topic: GET <topic>/json?poll=1&since=<cursor>.
+static void cmdFetch() {
+  cmdRawN = 0;
+  String url = C.ntfyCmd + "/json?poll=1&since=" + cmdSince;
+  WiFiClientSecure net;
+  net.setInsecure();                                  // authenticity comes from the ECDSA signature, not TLS
+  net.setHandshakeTimeout(TLS_HANDSHAKE_TIMEOUT_S);   // cap TLS handshake (< WDT)
+  HTTPClient http;
+  http.useHTTP10(true);                               // no chunked encoding -> raw stream == body
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  http.setTimeout(HTTP_READ_TIMEOUT_MS);
+  if (!http.begin(net, url)) { cmdNote("poll: http.begin failed"); return; }
+  esp_task_wdt_reset();
+  int code = http.GET();
+  esp_task_wdt_reset();
+  if (code == HTTP_CODE_OK) netOk(); else netFail(code);   // the 30 s poll doubles as the connectivity probe
+  if (code != HTTP_CODE_OK) {
+    char n[48]; snprintf(n, sizeof(n), "poll failed (HTTP %d)", code);
+    cmdNote(n);
+    http.end();
+    return;
+  }
+  WiFiClient* s = http.getStreamPtr();
+  static char line[CMD_MAX_LINE + 512];               // command + ntfy JSON envelope
+  size_t ln = 0, total = 0;
+  bool overflow = false, closed = false;
+  uint32_t t0 = millis();
+  while (millis() - t0 < CMD_POLL_MAX_MS && total < CMD_POLL_MAX_BYTES && cmdRawN < CMD_MAX_PER_POLL) {
+    if (!s->available()) {
+      if (!http.connected()) { closed = true; break; }
+      delay(2);
+      esp_task_wdt_reset();
+      continue;
+    }
+    int ch = s->read();
+    if (ch < 0) continue;
+    total++;
+    if (ch == '\n') {
+      line[ln] = 0;
+      if (ln) cmdTakeLine(line, !overflow);
+      ln = 0;
+      overflow = false;
+      continue;
+    }
+    if (ln + 1 >= sizeof(line)) { overflow = true; continue; }
+    line[ln++] = (char)ch;
+  }
+  // An unterminated last line is only trusted if the server closed the stream
+  // (end of body). If we stopped on our own time/byte cap it may be cut short;
+  // leave the cursor where it is so the next poll re-reads it whole.
+  if (closed && ln && !overflow && cmdRawN < CMD_MAX_PER_POLL) { line[ln] = 0; cmdTakeLine(line, true); }
+  http.end();
+  esp_task_wdt_reset();
+}
+
+// Loop hook: poll on the interval when it is safe, then run what arrived.
+static void serviceCommands() {
+  if (!cmdChannelEnabled()) return;
+  if (lastCmdPollMs != 0 && millis() - lastCmdPollMs < C.cmdIntervalS * 1000UL) return;
+  lastCmdPollMs = millis();
+
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!timeSynced()) { cmdNote("waiting for NTP (commands need a real clock)"); return; }
+  // The ring path always wins: never block on a poll around a live call.
+  if (callPending || digitalRead(RING_PIN) == LOW) return;
+  { uint32_t act = lastRingActiveMs;          // read before millis(): the 5 ms sampler writes it concurrently
+    if (everAlerted && millis() - act < RING_REARM_IDLE_MS) return; }
+  if (g_onProbation || otaState != PULL_OTA_IDLE) return;
+  if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < TLS_MIN_CONTIG_BLOCK) return;
+
+  cmdFetch();
+  handleRing();                              // sample the line right after the blocking GET
+  if (cmdRawN == 0) {
+    if (strncmp(cmdLastResult, "poll failed", 11) == 0 || strncmp(cmdLastResult, "enabled", 7) == 0
+        || strncmp(cmdLastResult, "waiting", 7) == 0)
+      cmdNote("polling; no new commands");
+    return;
+  }
+  for (uint8_t i = 0; i < cmdRawN; i++) {
+    // A REAL call latched (during the poll or a previous command's send): stop
+    // here and let serviceCallQueue() own the network. The unprocessed commands
+    // are still on the topic and newer than the floor, so the next poll -- which
+    // waits for the call to clear -- picks them up while they are fresh.
+    if (callPending && !callSimulated) {
+      strcpy(cmdSince, "6m");
+      cmdNote("real call in progress; remaining commands deferred");
+      break;
+    }
+    cmdProcess(cmdRaw[i]);
+    handleRing();                            // each command may do a TLS send
+    esp_task_wdt_reset();
+  }
+}
+
+// Auto-close an expired maintenance window with a "complete" notice on the
+// channel it was opened on. Survives reboots (NVS); retries until delivered.
+// If the notice is badly overdue (device was off/offline), it goes to STATUS
+// only, with the date, so the crew never gets a stale "window ended" days later.
+static const uint32_t MAINT_END_STALE_S = 15UL * 60UL;
+static void serviceMaint() {
+  if (!maintActive() || !timeSynced()) return;
+  uint32_t now = (uint32_t)time(nullptr);
+  if (now < maintEndEpoch) return;
+  if (lastMaintEndTryMs && millis() - lastMaintEndTryMs < MAINT_END_RETRY_MS) return;
+  lastMaintEndTryMs = millis();
+  if (WiFi.status() != WL_CONNECTED || callPending) return;
+  const bool stale = (now - maintEndEpoch) > MAINT_END_STALE_S;
+  char body[220];
+  if (stale) {
+    snprintf(body, sizeof(body),
+      "The maintenance window that was due to end %s ago (%s) has closed; the device was "
+      "offline at the time, so this notice is late. Resuming normal operations.",
+      fmtDuration(min(now - maintEndEpoch, (uint32_t)(40UL * 86400UL)) * 1000UL).c_str(),
+      fmtEpoch(maintEndEpoch).c_str());
+  } else {
+    char until[24]; fmtClock(maintEndEpoch, until, sizeof(until));
+    snprintf(body, sizeof(body),
+      "The scheduled maintenance window (until %s) has ended. Resuming normal operations.", until);
+  }
+  if (sendMaintEnd(maintToCall && !stale, body)) {
+    maintEndEpoch = 0;
+    persistCmdState();
+    cmdNote(stale ? "maintenance window closed late; notice sent to STATUS only"
+                  : "maintenance window expired; 'complete' notice sent");
   }
 }
 
@@ -2657,6 +3391,7 @@ void setup() {
 
   // ---- Runtime config from NVS (secrets live here, not in the image) -----
   loadConfig();
+  loadCmdState();               // remote-command replay floor + maintenance window (NVS "fhacmd")
   applyRingConfig();            // ring mode / min length from NVS (before the sampler starts)
 
   // ---- RAIL B: if we just booted a freshly-flashed image, start the 60 s
@@ -2810,6 +3545,8 @@ void loop() {
   serviceCrashReport();         // once: summary of a saved crash dump
   serviceBlackBox();            // checkpoints, WiFi events, connectivity probe, self-heal
   serviceDeadman();             // external check-in, withheld when degraded (opt-in)
+  serviceCommands();            // signed remote commands (inert unless provisioned)
+  serviceMaint();               // auto-close an expired maintenance window
   server.handleClient();        // serve status page / json / actions (fast)
 
   // ---- RAIL B: commit or roll back a freshly-flashed image on probation ----
@@ -2820,7 +3557,8 @@ void loop() {
   // otaSafeToStart() (no call pending/active, WiFi solid, heap OK, rollback slot
   // available). A check that finds + verifies a newer signed image reboots into
   // a 60 s trial; anything unsafe/unsigned is a no-op. NEVER starves handleRing().
-  if (millis() - lastOtaCheckMs >= C.otaIntervalMin * 60000UL) {
+  if (otaCheckNow || millis() - lastOtaCheckMs >= C.otaIntervalMin * 60000UL) {
+    otaCheckNow = false;
     lastOtaCheckMs = millis();
     if (otaEnabledAndSafe() && otaSafeToStart()) otaCheckManifest();
   }
@@ -3089,7 +3827,7 @@ static void handleHeartbeat() {
   char ts[48];
   formatTimestamp(ts, sizeof(ts));
   uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-  char msg[320];
+  char msg[400];
   snprintf(msg, sizeof(msg),
            "Ring detector still online (hourly check-in, seq %lu). %s. Rings since "
            "boot: %lu (ignored non-ring line activity: %lu). Free heap %u B, largest block %u B "
@@ -3097,6 +3835,11 @@ static void handleHeartbeat() {
            (unsigned long)heartbeatSeq, ts, (unsigned long)ringCount, (unsigned long)ignoredActivity,
            (unsigned)ESP.getFreeHeap(), (unsigned)largest, (unsigned)esp_get_minimum_free_heap_size(),
            (int)WiFi.RSSI(), (unsigned)wifiDrops);
+  if (maintActive()) {
+    char until[24]; fmtClock(maintEndEpoch, until, sizeof(until));
+    size_t n = strlen(msg);
+    snprintf(msg + n, sizeof(msg) - n, " Maintenance window open until %s.", until);
+  }
   // Health check, not a log: sent live or not at all (never queued/resent late).
   sendNtfy(C.ntfyStatus.c_str(), "Tapout heartbeat",
            msg, "min", "green_heart");
@@ -3105,7 +3848,7 @@ static void handleHeartbeat() {
 // ---------------------- ntfy notification -------------------------------
 static bool sendNtfy(const char* url, const char* title, const char* message,
                      const char* priority, const char* tags) {
-  if (!crewSendOpen && C.ntfyCall.length() && strcasecmp(url, C.ntfyCall.c_str()) == 0) {
+  if (!crewSendOpen && C.ntfyCall.length() && sameTopic(String(url), C.ntfyCall)) {
     Serial.printf("[ntfy] REFUSED a non-alert message to the crew CALL topic: %s\n", title);
     return false;                        // crew channel = the standard ring alert only (see crewSendOpen)
   }

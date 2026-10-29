@@ -212,6 +212,10 @@ HTTP Basic Auth as the other admin endpoints and never echoes secrets back.
 | `ota_manifest` | `ota_manifest` | "" (disabled) | raw GitHub manifest URL |
 | `ota_enabled` | `ota_enabled` | `false` | `1` = auto pull-OTA on |
 | `ota_interval` | `ota_interval` | `360` | manifest poll interval, minutes |
+| `ntfy_cmd` | `ntfy_cmd` | "" (disabled) | private command topic URL for `tools/tapout` (v2.1.0) |
+| `ring_mode` | `ring_mode` | `single` | `single` = page on the 1st ring; `pattern` = only on a 2-ring pattern |
+| `ring_min_ms` | `ring_min_ms` | `500` | single mode: page once a ring lasts this long (100–3000) |
+| `cmd_interval` | `cmd_interval` | `30` | command-topic poll interval, seconds (15–3600) |
 
 > **Security by default (fail closed):** while `web_pass` or `ota_pass` is still
 > the shipped `CHANGE-ME` placeholder, the matching feature stays **DISABLED** —
@@ -551,6 +555,140 @@ Let's Encrypt rotation can't fail the CALL path closed; outbound 443 to ntfy is
 pinned to its single IP. **For OTA, authenticity does not rely on TLS at all** —
 it relies on the embedded signing key (RAIL A). If you suspect tampering on the
 alert path, rotate the `ntfy_*` topics via `/provision`.
+
+## Remote commands (`tools/tapout`, v2.1.0)
+
+A local CLI that drives the deployed unit from anywhere, over the one path the
+IoT VLAN already allows (outbound 443 to ntfy.sh). The device **polls** a private
+command topic every `cmd_interval` seconds (default 30) and acknowledges every
+command on the **STATUS** topic.
+
+```sh
+# one-time setup
+tools/tapout init --status-url https://ntfy.sh/<status-topic>   # topic + ECDSA key pair; rewrites tapout/cmd_public_key.h
+git add tapout/cmd_public_key.h && git commit -m "cmd key"      # ...then cut a release (the device needs the key compiled in)
+tools/tapout provision --device http://<device-ip>              # POST /provision ntfy_cmd (no secrets), reboot
+tools/tapout ping                                               # device replies on STATUS
+
+tools/tapout test                                  # [TEST] notification -> STATUS
+tools/tapout maint start --minutes 45              # maintenance window, announced on STATUS
+tools/tapout maint end                             # "complete, resuming normal operations" on STATUS
+tools/tapout send -t "Line work" -m "Tue 0900" [-p low|default|high]   # custom message to STATUS ("announce" works too)
+tools/tapout send -m "hello" --url other-topic      # custom message to any other ntfy topic
+tools/tapout test --url https://ntfy.sh/other      # [TEST] to any other ntfy topic
+tools/tapout set-topic status|cmd <url>             # change a device topic (verified first)
+tools/tapout set-topic call <url>                   # STAGE a crew-topic move ([TEST] alert sent there)
+tools/tapout confirm-topic call                     # ...activate it once the crew got the [TEST] alert
+tools/tapout revert-topic call|status|cmd           # undo the last move (call: staged + confirmed again)
+tools/tapout ring-mode single [--min-ms 500]       # page on the 1st ring (default)
+tools/tapout ring-mode pattern                     # page only on a 2-ring pattern (asks you to type 'yes')
+tools/tapout sim-ring [--to call]                  # same as POST /simulate-ring; --to call = [TEST] alert to the crew
+tools/tapout check-ota                             # check GitHub for a signed update now
+tools/tapout reboot
+tools/tapout watch                                 # tail STATUS
+```
+
+Global flags: `--dry-run` (print the signed line, send nothing), `--no-wait`,
+`--timeout N`, `-y/--yes` (skip the crew confirmation; required when not on a TTY).
+
+**The crew channel only ever carries the standard ring alert.** Everything else
+goes to STATUS, which is the device's log channel: command acks, tests, custom
+messages, maintenance notices, and all health and diagnostic detail, including
+"first send failed / delivered late".
+
+- **Firmware gate:** `sendNtfy()` refuses the crew CALL topic unless the call
+  comes from the ring-alert function itself.
+- **Commands:** the device refuses `to=call` for every command except
+  `sim-ring --to call`. That is the standard alert, `[TEST]`-labelled, for
+  checking the crew's phones, and the CLI makes you type `crew` first.
+- **The CLI** never knows the CALL topic URL.
+
+**Other topics and changing topics.** `--url` takes a bare topic name (which
+becomes `https://ntfy.sh/<name>`) or a URL of exactly the form
+`https://<host>/<topic>`. The topic may use letters, digits, `-` and `_`; ports,
+extra path segments, `?query`, `#fragment` and trailing slashes are refused on
+both the CLI and the device. The device refuses a `--url` that is its CREW or
+command topic. Before comparing, it normalises both URLs: host case, a
+`?query`, `#fragment`, `:443` and a trailing slash are all ignored, because ntfy
+treats those spellings as the same topic. Titles must be a single line, since they become an HTTP
+header.
+
+- **`set-topic status`** sends a `[TEST] Tapout channel check` to the new URL.
+  It switches only if that succeeds, keeps the old value as `prev_status` in
+  NVS, and acknowledges on the *old* status topic.
+- **`set-topic cmd`** test-polls the new inbox before switching, so the device
+  can't go deaf.
+- For `status` and `cmd`, the CLI requires the device's ack (no `--no-wait`).
+  It rewrites `status_url`/`cmd_url` in its config only when the ack says
+  `<which> topic changed`.
+- **`set-topic call` is two-step.** ntfy accepts a post to *any* topic name, so
+  a delivered test can't prove anyone is subscribed. The device only
+  **stages** the change: it sends the standard alert, `[TEST]`-labelled, to the
+  new URL, keeps real alerts on the current topic, and returns a confirm code.
+  - After the crew confirm they got the `[TEST]` alert,
+    `tapout confirm-topic call` activates it within 30 min. The code is
+    remembered by the CLI.
+  - Nothing is posted on the *old* crew topic, since crew channels carry only
+    the standard alert. Tell anyone subscribed there to switch.
+  - A reboot or a 30-minute timeout cancels the staging.
+  - `revert-topic call` goes through the same stage-and-confirm steps.
+- The three topics must stay distinct. Moving the crew topic asks you to type
+  `crew`; the others ask for `yes`.
+
+**Maintenance mode is informational.** It announces a window, shows a
+MAINTENANCE pill on the status page, mentions it in the heartbeat, and
+auto-closes with a "complete" notice when it expires. The window is kept in NVS,
+so it survives the reboots maintenance usually involves.
+
+- Maintenance notices go to STATUS only. If the end notice is more than 15 min
+  late (for example, the device was off), it carries the date.
+- Maintenance mode **never suppresses or alters a real ring alert**.
+
+**Security model.** The same asymmetric model as the signed OTA updates. Wire
+format and verifier: `tapout/cmd_proto.h`.
+
+- Every command is one line signed with **ECDSA P-256 / SHA-256**, using the
+  operator's **private** key. That key lives only at
+  `~/.config/tapout/cmd_private_key.pem` (mode 600; back it up). The CLI signs
+  with the system `openssl`.
+- The device holds only the **public** key, compiled in from
+  `tapout/cmd_public_key.h`. That file is committed and not secret, like
+  `public_key.h` for OTA.
+  - Nothing secret is ever provisioned to or stored on the device, and
+    `/provision` only sets the topic.
+  - A dumped device can't forge commands.
+  - Changing who can command the unit takes a signed firmware release.
+- While the header is still the `CHANGE-ME` placeholder, the command channel
+  stays **off** (`cmd_key_installed:false` in `/status.json`).
+- The signature covers every field, including the destination, so nothing can
+  be re-routed to the crew.
+- Accepted only if signed within ±5 min of device time (needs NTP) **and** newer
+  than every command ever accepted (floor persisted in NVS before executing, so
+  a `reboot` can't replay itself after the reboot).
+- Unauthentic messages are ignored, with at most one "rejected command" STATUS
+  ping per 10 min.
+- Knowing the command topic lets someone *read* your commands (ntfy topics are
+  public-by-name) and post junk, but not forge one.
+- If the private key leaks, run `tapout init --force`, commit the new header and
+  cut a release. Until that release is installed, the old key still works.
+  `--force` keeps your command topic and moves the old key to
+  `cmd_private_key.pem.bak-<timestamp>`.
+- `tapout ring-mode single --min-ms N` accepts 100–1500 ms and asks you to
+  confirm anything above 1000 ms. A normal ring is about 2 s, so a higher
+  threshold could miss every call.
+- The device never polls while a call is latched, the line is ringing or just
+  rang, during OTA, or on OTA probation. If a real call latches while a batch of
+  commands is running, the rest waits for the next poll. A `reboot`, whether
+  remote or from the web page, is held until any real call alert has been
+  delivered. Each poll is one bounded TLS GET, and
+  `handleRing()` runs immediately after it.
+- Fully inert until a real public key is compiled in **and** `ntfy_cmd` is
+  provisioned. The command topic must differ from the CALL and STATUS topics.
+
+`tools/test_cmd_proto.sh` cross-checks the CLI signer against the device's C
+verifier on the host, built against OpenSSL (`brew install openssl@3`). It
+covers valid commands, a different key, re-routing, field tampering, the old
+HMAC format and the placeholder key.
 
 ## Security notes
 
