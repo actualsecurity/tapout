@@ -64,14 +64,54 @@ voltage reaches the ESP32.
 These all still work in v2.0.0 and run **before** any of the new code each loop:
 
 - **WiFi connect + non-blocking reconnect** with exponential backoff.
-- **Active-low ring detection** — 25 ms debounce, 60 s cooldown ceiling, and an
-  8 s idle re-arm so one call's ring cadence collapses to a single alert while
-  two genuinely distinct calls each page. **This is the life-safety path and runs
-  first every loop — never starved, including during a firmware download.**
+- **Active-low ring detection that ignores boot/replug blips** (v2.0.10,
+  `tapout/ring_detect.h`). D4 is sampled every 5 ms by a dedicated `esp_timer`,
+  so blocking network sends in `loop()` can never hide or split a ring.
+  Detection **arms only after the line has read idle for 3 s continuously**, so
+  the D4 blip while the board boots, which is what paged the crew on every
+  power unplug/replug, can never page. Two modes, set by `ring_mode` (NVS,
+  applied live):
+  - **`single` (default):** pages once **one** ring has lasted `ring_min_ms`
+    (default 500 ms, range 100–1500; a normal ring is ~2 s, so higher could miss every call), i.e. on the **first** ring. The station
+    line may ring only once before the call rolls to county dispatch.
+    Shorter blips are ignored.
+    - Trade-off: a power sag of at least `ring_min_ms` while the board stays
+      powered can still page.
+  - **`pattern` (opt-in):** pages only on a ring pattern:
+    - **(A)** two ring-shaped bursts (0.3–3.5 s) within 8 s, or
+    - **(B)** three or more bursts of at least 0.3 s, each within 8 s of the
+      previous.
+    - A single burst of any length never pages. The cost is the page fires on
+      the 2nd ring, and a call that rings only once **doesn't page**.
+  - **Setting it:** `curl -u crew:<pass> -d ring_mode=pattern http://<device>/provision`
+    (or `ring_min_ms=800`). From v2.1.0, `tapout ring-mode` does the same.
+  - **Ignored activity** goes to STATUS as "Line activity ignored (not a ring)",
+    at most one attempt per 10 min. It is counted in the heartbeat, the
+    status page and `/status.json` (`ignored_line_activity`,
+    `line_glitches`). The JSON also shows `ring_mode` and `ring_min_ms`.
+  - **One alert per call:** "same call or a new one?" is decided from the
+    continuous samples (8 s idle re-arm, 60 s ceiling).
+  - **Arming watchdog:** if detection hasn't armed 60 s after boot, STATUS
+    gets "Ring detector NOT armed". `/status.json` reports `healthy:false`
+    with fault `detector_unarmed`, the dead-man check-in is withheld, and the
+    status pill says "Arming".
+  - **No reboot wipes a call:** reboots (`/reboot`, OTA staged, OTA rollback)
+    are held while a real call is confirmed or in flight.
+  - **This is the life-safety path. It is never starved, including during a
+    firmware download.**
 - **ntfy.sh HTTPS alert** (Pushover template included, commented out).
-- **Never-lose-a-call retry latch** — a detected ring is latched and retried
-  until delivered; if delivery ultimately fails it surfaces a failure notice on
-  the STATUS topic. Retries are *not* burned while WiFi is down.
+- **Pre-alert retry latch, with a 2-minute deadline.** A detected ring is
+  latched and retried until it is delivered, but only for **2 min after the
+  ring**, whether WiFi is down or up with no internet. A later pre-alert is
+  useless, because the real dispatch page has gone out by then. A call that
+  misses the window is dropped and logged on STATUS as "Pre-alert NOT sent (too
+  late)", sent once the network is back.
+- **The crew channel only ever carries the standard alert:** "Incoming call on
+  the station line at <time the phone rang>". If the first send fails and a
+  retry delivers it, the crew still gets exactly that, and STATUS gets "Crew
+  alert: first send failed" with the first error code and how late it was.
+  v2.0.9 used to change the crew text to "…(alert delayed by network)". A
+  firmware gate refuses every other message to the crew topic.
 - **NTP wall-clock timestamps** on CALL alerts (graceful uptime fallback).
 - **mDNS + LAN status web page** at `http://tapout.local`, with a
   `/status.json` endpoint and auth-gated reboot / send-test / simulate actions.
@@ -416,6 +456,81 @@ gracefully if its rule is missing.
 
 ---
 
+## Black box, restart reports & self-heal (v2.0.10)
+
+The unit needed manual reboots a few times on v2.0.9 and nothing recorded why.
+Now it does.
+
+**After every restart**, the first thing sent once WiFi is back is a
+**"Tapout restarted"** message on STATUS. It goes at **high** priority, titled
+"…UNEXPECTEDLY", whenever the restart wasn't requested. It says:
+
+- **Cause:**
+  - a **requested** restart, with the reason: OTA update, `/reboot`,
+    `/provision`, setup portal, OTA rollback, or self-heal
+  - **POWER LOSS:** unplugged, power-cycled, reset button, or the supply cut
+    out
+  - **BROWNOUT:** the supply sagged
+  - **CRASH**
+  - **HANG:** the watchdog restarted frozen firmware
+- **Downtime:** when the device was last alive, and how long ago that was.
+- **Just before:** uptime, WiFi up or down plus signal, the last successful
+  send, failures in a row, WiFi drops (with the router's last disconnect
+  reason), and free memory, largest block and low-water mark.
+- **Recent events:** WiFi lost or back, "no internet while WiFi up", send
+  failures, self-heal actions, low memory, calls, restarts.
+
+If the firmware crashed, a second **"Tapout crash report"** gives the task,
+crash address and backtrace, then clears the dump. Decode it with the release's
+`tapout.ino.elf`, which CI now attaches to every GitHub release:
+`xtensa-esp32s3-elf-addr2line -pfiaC -e tapout.ino.elf <addresses>`.
+
+**How it's recorded:** a small flight recorder holds a checkpoint and the last
+16 events.
+
+- A copy in RTC memory is refreshed every minute. It survives crashes,
+  watchdog resets and software restarts.
+- A copy in NVS is written every 5 min and before every requested restart. It
+  survives power loss, so the "last sign of life" is accurate to about 5 min
+  after a power cut.
+- The hourly heartbeat now also shows the WiFi signal, drops since boot and
+  the memory low-water mark.
+- `/status.json` adds `restart_why`, `wifi_drops`, `last_disconnect_reason`,
+  `net_ok_ms_ago`, `net_fail_probes`, `heal_streak` and `crash_dump_pending`.
+
+**Self-heal.** v2.0.9 only reconnected when WiFi reported *disconnected*. If
+WiFi stayed "connected" but nothing got through, the watchdog stayed happy and
+the unit just went dark. Now:
+
+- Whenever nothing has succeeded for 5 min, it runs a cheap probe (an ntfy
+  poll that creates no message).
+- **3 failed probes:** it forces a WiFi reconnect.
+- **5 failed probes (~25 min):** it reboots.
+- **WiFi down for 15 min:** it reboots, backing off to 30, 60 and 120 min if
+  the outage continues.
+- Each heal is logged and shows up in the next restart report.
+- It never self-heals during an OTA download or trial.
+
+**Calls survive a restart, within the 2-minute window.** A real call that was
+detected but not yet delivered is saved. After a restart it is sent to the crew
+as the standard alert, if it is still under 2 min since the ring. The clock
+survives a software or watchdog restart; after a power cut its age is unknown.
+Otherwise it is reported on STATUS only.
+
+**Knowing while it's down: the dead-man check-in.** A device that's off can't
+report anything, so this needs an outside watcher. The firmware already pings
+a URL every 15 min while healthy, and withholds the ping when it's degraded
+(WiFi down, detector stuck or unarmed, memory too fragmented). One-time setup:
+
+1. Create a free check at [healthchecks.io](https://healthchecks.io): period
+   15 min, grace 15 min.
+2. In that check's **Integrations**, add **ntfy** with your STATUS topic. The
+   STATUS channel then gets "Tapout is DOWN" within about 30 min of the device
+   going quiet, and "UP" when it's back.
+3. Give the device the check's ping URL:
+   `curl -u crew:<web_pass> -d deadman=https://hc-ping.com/<uuid> http://<device>/provision`.
+   No reboot is needed; it takes effect within 15 min.
+
 ## Notifications
 
 Two ntfy topics, so real calls don't get lost in monitoring noise:
@@ -467,6 +582,16 @@ alert path, rotate the `ntfy_*` topics via `/provision`.
    confirm a deliberately-unhealthy build auto-rolls-back.
 6. **Tune the cooldown / re-arm** if a single call yields more/fewer alerts than
    wanted.
+7. **Confirm a real call is detected.** Place a test call and check that it
+   pages on the first ring in `single` mode (on the 2nd in `pattern` mode) and
+   that STATUS shows **no** "Line activity ignored" note. Then compare `recent_bursts` in `/status.json`: each ring
+   should be about 2000 ms long, and consecutive `ago_ms` about 6000 ms apart.
+   Do the same after unplugging and replugging the phone cord: it should show
+   one burst and an "ignored" note, never a page. The design assumes the
+   ELK-930 output *follows the ring cadence*. If it held D4 low for the whole
+   call, calls would show up as one long ignored burst instead of paging.
+   `tools/test_ring_detect.cpp` replays 30 simulated waveforms on the host:
+   `c++ -std=c++17 -o /tmp/trd tools/test_ring_detect.cpp && /tmp/trd`.
 
 ## Reliability hardening
 

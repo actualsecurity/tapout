@@ -23,7 +23,10 @@
  *
  * Features:
  *   - WiFi connect + non-blocking reconnect with exponential backoff
- *   - ELK-930 active-low ring detection (25 ms debounce, 60 s cooldown)
+ *   - ELK-930 active-low ring detection, sampled every 5 ms off-loop, armed only
+ *     after 3 s of idle line (boot/replug blips never page). ring_mode=single
+ *     (default) pages once a ring lasts ring_min_ms (500 ms) -- the 1st ring;
+ *     ring_mode=pattern pages only on a 2-ring pattern. One alert per call.
  *   - ntfy.sh HTTPS alert (Pushover alternative included, commented out)
  *   - NEVER-LOSE-A-CALL: a ring is latched + retried until delivered (or it
  *     surfaces a delivery-failure on the STATUS topic) so a WiFi/ntfy blip
@@ -90,7 +93,12 @@
 #include <mbedtls/md.h>     // MBEDTLS_MD_SHA256
 #include <esp_ota_ops.h>    // esp_ota_* A/B partition + rollback (RAIL B)
 #include <DNSServer.h>      // captive-portal DNS for the SoftAP setup mode
+#include <esp_timer.h>      // 5 ms D4 sampler, independent of loop() (ring detection)
+#include <esp_core_dump.h>  // read + report a saved crash dump after a crash reboot
+#include <esp_app_desc.h>   // esp_app_get_elf_sha256: which build a crash dump came from
+#include <stdarg.h>
 #include "public_key.h"     // RSA-2048 signing public key (RAIL A) -- committed, not secret
+#include "ring_detect.h"    // ring-PATTERN detector (rejects boot/replug/brownout blips)
 
 // ======================= USER CONFIG -- SECRET-FREE DEFAULTS =============
 // v2.0.0: ALL secrets now live in NVS namespace "fhacfg" (Preferences), written
@@ -128,6 +136,7 @@ static const uint32_t DEADMAN_PING_MS = 15UL*60UL*1000UL;  // >= 5 min; longer t
 // function definition, so any type a prototype references must be declared above
 // that point or the generated formatEvent() prototype fails to compile.
 struct RingEvent;
+struct BoxRec;      // same reason: boxCrc()/boxValid() prototypes reference it
 
 // Pull-OTA manifest-check interval bounds (minutes). A 0 / non-numeric operator
 // entry would otherwise make the loop scheduler fire otaCheckManifest() on EVERY
@@ -142,6 +151,16 @@ static inline uint32_t clampOtaInterval(uint32_t v) {
   return v;
 }
 
+// Single-mode ring threshold bounds: below ~100 ms is glitch territory. The
+// ceiling stays well under a normal ~2 s US ring: at >= ~2 s every ring would end
+// before reaching the threshold and NO call would ever page.
+static const uint32_t RING_MIN_MS_MAX = 1500;
+static inline uint32_t clampRingMinMs(uint32_t v) {
+  if (v < 100)             return 100;
+  if (v > RING_MIN_MS_MAX) return RING_MIN_MS_MAX;
+  return v;
+}
+
 // ---- Runtime config struct (populated from NVS "fhacfg" by loadConfig) -------
 static Preferences cfg;                       // NVS namespace "fhacfg"  (<=15 chars)
 struct Cfg {
@@ -150,6 +169,8 @@ struct Cfg {
   String   otaFailedVer;   // version that just failed health probation (skip re-stage)
   bool     otaEnabled;
   uint32_t otaIntervalMin;
+  uint8_t  ringMode;       // RD_MODE_SINGLE (default: page on the 1st ring) | RD_MODE_PATTERN
+  uint32_t ringMinMs;      // single mode: page once a ring has lasted this long
   bool     provisioned;
 } C;
 
@@ -180,6 +201,8 @@ static void loadConfig() {
   // by an older build or a hand-edited namespace, not just the write path.
   C.otaIntervalMin = clampOtaInterval(cfg.getUInt("ota_interval", 360));  // 6 h default
   C.provisioned    = cfg.getBool("provisioned", false);
+  C.ringMode       = cfg.getUChar("ring_mode", RD_MODE_SINGLE) == RD_MODE_PATTERN ? RD_MODE_PATTERN : RD_MODE_SINGLE;
+  C.ringMinMs      = clampRingMinMs(cfg.getUInt("ring_min_ms", RD_SINGLE_MIN_DEFAULT_MS));
   cfg.end();
 }
 
@@ -193,7 +216,8 @@ static bool isProvisioned() {
 static const int RING_PIN = D4;   // ELK-930 open-collector output (active LOW)
 
 // --------------------------- Tunables -----------------------------------
-static const uint32_t DEBOUNCE_MS         = 25;             // confirm ring is real
+// (Ring qualification -- arm delay, burst length, 2-burst pattern -- lives in
+//  ring_detect.h; see RD_* there.)
 static const uint32_t COOLDOWN_MS         = 60UL * 1000UL;  // absolute re-alert ceiling
 // Re-arm for a NEW call once the line has been idle (HIGH) at least this long --
 // longer than the within-call inter-ring silence (US cadence ~4 s off). This lets
@@ -218,8 +242,16 @@ static const uint16_t HTTP_READ_TIMEOUT_MS    = 4000;
 static const uint8_t  TLS_HANDSHAKE_TIMEOUT_S = 10;
 
 // Never-lose-a-call retry of the CALL alert when WiFi/ntfy is down.
-static const uint8_t  CALL_MAX_ATTEMPTS = 12;          // ~1 min of retries
-static const uint32_t CALL_RETRY_MS     = 5000;        // gap between retries
+static const uint8_t  CALL_MAX_ATTEMPTS = 12;          // fast retries (~1 min), then slow ones
+static const uint32_t CALL_RETRY_MS     = 5000;        // gap between the fast retries
+static const uint32_t CALL_SLOW_RETRY_MS = 30000;      // gap after that
+// A pre-alert is only useful within ~2 min of the ring: after that the real
+// dispatch page (60 Control) has already gone out, so a late one is just noise.
+// A REAL call is retried (WiFi down or up) until this long after the ring, then
+// dropped and logged on STATUS. (v2.0.9 held it forever while WiFi was down and
+// paged hours late; while WiFi was up it gave up after ~1 min with a notice that
+// usually couldn't get out either.)
+static const uint32_t CALL_STALE_MS     = 2UL * 60UL * 1000UL;
 
 // Non-blocking red-LED hold after a ring (replaces the old blocking delay).
 static const uint32_t RING_LED_HOLD_MS  = 1500;
@@ -244,14 +276,39 @@ static const uint8_t  RINGLOG_N         = 20;          // events kept on flash
 static const uint8_t  RINGLOG_VERSION   = 2;           // bump if blob layout changes (v2 adds simMask)
 
 // Web identity / build stamp.
-static const char* FW_VERSION    = "2.0.9";
+static const char* FW_VERSION    = "2.0.10";
 static const char* FW_BUILD_MARK = __DATE__ " " __TIME__;
 
 // --------------------------- State --------------------------------------
 static uint32_t lastAlertMs      = 0;
-static uint32_t lastRingActiveMs = 0;       // millis() the line was last seen LOW
+static volatile uint32_t lastRingActiveMs = 0;  // millis() the line was last active (>= 30 ms); written by the ring sampler
 static bool     everAlerted      = false;
-static bool     ringArmed        = false;   // false until D4 first reads idle (HIGH); blocks boot-transient / stuck-line / no-line false pages
+// ---- Ring detection state. ringSample() (the 5 ms esp_timer) owns everything
+// below; loop() only reads it under ringMux or consumes the *Pending counters.
+static RingDet      ringDet          = {};  // ring-pattern detector (ring_detect.h)
+static portMUX_TYPE ringMux          = portMUX_INITIALIZER_UNLOCKED;
+static esp_timer_handle_t ringTimer  = nullptr;
+static bool         ringTimerOk      = false;   // false => loop() samples inline (fallback)
+static bool         idleSinceAlert   = true;    // line idle >= RING_REARM_IDLE_MS since the last page (=> next pattern is a NEW call)
+static uint32_t     ringPagesPending = 0;       // confirmed NEW calls not yet handed to the alert pipeline
+static uint32_t     ringPageAtMs     = 0;       // millis() the newest one was confirmed
+static uint32_t     ringDetectedAtMs = 0;       // ...as handed to triggerRingPipeline() (message age)
+// Line activity that did NOT form a ring pattern (boot blip, power/cord replug,
+// brownout...). Never pages; surfaced on STATUS (throttled), heartbeat and JSON.
+static const uint32_t IGNORED_PING_MS = 10UL * 60UL * 1000UL;
+static uint32_t     ignoredActivity    = 0;     // runs of >= 0.3 s activity that weren't a ring (since boot)
+static uint32_t     glitchCount        = 0;     // isolated < 0.3 s blips (since boot; counted only)
+static uint32_t     ignoredPending     = 0;
+static uint32_t     lastIgnoredMs      = 0;
+static uint32_t     lastIgnoredLenMs   = 0;
+static uint32_t     lastIgnoredBursts  = 0;
+static uint32_t     lastIgnoredPingMs  = 0;
+static bool         ignoredPingPending = false;
+// Last few bursts (>= 30 ms) for field validation of real D4 timing in /status.json.
+struct BurstRec { uint32_t startMs, lenMs; };
+static const uint8_t BURSTLOG_N = 8;
+static BurstRec     burstLog[BURSTLOG_N];
+static uint8_t      burstLogHead = 0, burstLogCount = 0;
 static uint32_t lastHeartbeatMs  = 0;
 static uint32_t wifiBackoffMs    = WIFI_BACKOFF_MIN_MS;
 static uint32_t lastWifiAttempt  = 0;
@@ -279,6 +336,99 @@ static const char*  gResetReason = "unknown";
 static const uint32_t LINE_STUCK_MS  = 20000;   // D4 LOW this long continuously = stuck
 static uint32_t lineLowSinceMs   = 0;           // millis() D4 first went continuously LOW (0 = idle/HIGH)
 static bool     lineStuckWarned  = false;       // warned about the current stuck episode
+
+// ----- Black box / self-heal (defined in the BLACK BOX section) -----
+static const uint32_t BOX_MAGIC          = 0x54504258;    // "TPBX"
+static const uint8_t  BOX_VERSION        = 1;
+static const uint8_t  BOX_EVENTS         = 16;
+static const uint32_t BOX_RTC_MS         = 60UL * 1000UL;        // refresh the RTC checkpoint
+static const uint32_t BOX_NVS_MS         = 5UL * 60UL * 1000UL;  // persist to flash
+static const uint32_t NET_PROBE_MS       = 5UL * 60UL * 1000UL;  // probe if nothing succeeded this long
+static const uint8_t  NET_HEAL_RECONNECT = 3;                    // failed probes -> reconnect WiFi
+static const uint8_t  NET_HEAL_REBOOT    = 5;                    // failed probes -> reboot
+static const uint32_t WIFI_DOWN_REBOOT_MS = 15UL * 60UL * 1000UL; // x 1/2/4/8 with the heal streak
+static const uint32_t RESTORED_CALL_MAX_S = CALL_STALE_MS / 1000;  // same freshness rule after a restart
+
+enum BoxEv : uint8_t {
+  EV_BOOT = 1, EV_WIFI_LOST, EV_WIFI_UP, EV_NET_DOWN, EV_NET_UP, EV_SEND_FAIL,
+  EV_HEAL_RECONNECT, EV_HEAL_REBOOT, EV_LOW_HEAP, EV_CALL, EV_REBOOT_REQ
+};
+
+struct __attribute__((packed)) BoxCp {
+  uint32_t epoch;          // 0 = clock not synced
+  uint32_t upS;
+  uint32_t bootCount;
+  uint32_t freeHeap, largest, minFree;
+  uint32_t sinceOkS;       // s since the last successful network op; 0xFFFFFFFF = never
+  uint32_t ringCount;
+  uint16_t wifiDrops;
+  uint16_t lastDisc;       // last WiFi disconnect reason code
+  int8_t   rssi;
+  uint8_t  wifiUp;
+  uint8_t  failStreak;     // consecutive failed sends/probes while "connected"
+  uint8_t  pad;
+};
+struct __attribute__((packed)) BoxEvt { uint32_t epoch, upS; uint8_t code, pad; uint16_t arg; };
+struct __attribute__((packed)) BoxRec {
+  uint32_t magic;
+  uint8_t  version, head, count, pad;
+  BoxCp    cp;
+  BoxEvt   ev[BOX_EVENTS];
+  uint32_t crc;
+};
+
+RTC_NOINIT_ATTR static BoxRec   boxRtc;     // survives crash/WDT/software resets (not power loss)
+RTC_NOINIT_ATTR static uint32_t healMagic, healStreak;  // consecutive self-heal reboots without recovery
+static BoxRec    box = {};                  // live recorder for this boot
+static BoxRec    boxPrev = {};              // what the previous boot left behind
+static bool      boxPrevValid = false;
+static bool      boxPrevFromRtc = false;
+static char      rebootWhy[96] = "";        // reason the PREVIOUS boot recorded before restarting
+static uint32_t  lastBoxRtcMs = 0, lastBoxNvsMs = 0;
+static uint32_t  lastNetOkMs = 0;           // millis() of the last successful send/probe
+static bool      netEverOk = false;
+static uint8_t   netFailStreak = 0;
+static uint8_t   netFailProbes = 0;
+static uint32_t  lastProbeMs = 0;
+static uint32_t  wifiDownSinceMs = 0;
+static uint16_t  wifiDrops = 0;
+static volatile uint16_t lastDiscReason = 0;  // written by the WiFi event task
+static bool      restartReported = false;
+static bool      crashPending = false;
+static esp_core_dump_summary_t crashSum;
+static char      crashReason[64] = "";
+static uint32_t  savedCallEpoch = 0;        // a real call detected before the restart (NVS), 0 = none
+static bool      savedCallChecked = false;
+static bool      savedCallForce = false;    // (legacy NVS flag; no longer pages stale calls)
+static uint32_t  callExpireMs = 0;          // millis() after which the latched REAL call is stale (CALL_STALE_MS)
+static char      expiredNote[320] = "";     // STATUS log for a pre-alert that was dropped as stale
+static uint32_t  lastExpiredNoteTryMs = 0;
+static uint8_t   bootEvHead = 0, bootEvPrior = 0;  // where this boot's events start in the ring
+
+static uint32_t callRestoredEpoch = 0;   // != 0: the latched call was saved before a restart
+static uint32_t callRingEpoch = 0;       // wall-clock time the phone rang (0 = unknown / clock unsynced)
+static int      lastNtfyCode = 0;        // last sendNtfy() result (HTTP code, or <0 transport error)
+static int      callLastFailCode = 0;    // last error of THIS call's crew sends (not polluted by STATUS sends)
+// Crew-channel gate: sendNtfy() refuses the CALL topic unless this is set, and
+// only fireCallAlert() sets it (around its one send). Nothing else -- status,
+// health, OTA, diagnostics, future code -- can ever reach the crew channel.
+static bool     crewSendOpen = false;
+static int      callFirstFailCode = 0;   // error of the FIRST failed send of the current call (STATUS log)
+static char     pendingRebootWhy[72] = "requested reboot";   // recorded by the deferred-reboot handler
+static void boxBoot();
+static void boxSaveCall();
+static void boxClearCall();
+static void boxClearCallIf(uint32_t expect);
+static void boxEvent(uint8_t code, uint16_t arg);
+static void netOk();
+static void netFail(int code);
+static void noteReboot(const char* why);
+static void serviceBlackBox();
+static void serviceRestartReport();
+static void serviceCrashReport();
+static void serviceSavedCall();
+static bool logStatus(const char* title, const char* body, const char* prio, const char* tags);
+static void serviceStatusLog();
 
 // ----- Never-lose-a-call queue -----
 static bool     callPending    = false;
@@ -385,6 +535,11 @@ static void announceOnlineOnce();
 static void serviceStuckLine();
 static void serviceCredWarn();
 static void serviceHeapCheck();
+static void serviceIgnoredActivity();
+static void serviceArmCheck();
+static void startRingSampler();
+static void applyRingConfig();
+static bool realCallInFlight();
 static void fireCallAlert(bool simulated);
 static void serviceCallQueue();
 static void triggerRingPipeline(bool simulated);
@@ -481,6 +636,11 @@ static const char* resetReasonToStr(esp_reset_reason_t r) {
     case ESP_RST_EXT:       return "External reset";
     case ESP_RST_DEEPSLEEP: return "Deep-sleep wake";
     case ESP_RST_SDIO:      return "SDIO";
+    case ESP_RST_USB:       return "USB reset";
+    case ESP_RST_JTAG:      return "JTAG reset";
+    case ESP_RST_EFUSE:     return "eFuse error";
+    case ESP_RST_PWR_GLITCH:return "Power glitch";
+    case ESP_RST_CPU_LOCKUP:return "CPU lockup";
     default:                return "Unknown";
   }
 }
@@ -572,16 +732,11 @@ static void formatEvent(const RingEvent &e, char *out, size_t n) {
 // Send the boot "online" ping the first time WiFi is up -- works whether the
 // connection completes during setup() or later in the loop (serviceWifi).
 // Now reports boot count + last reset reason + free heap (brownout canary).
+// v2.0.10: replaced by the black-box restart report (cause, downtime, what it
+// looked like just before, recent events) -- see serviceRestartReport().
 static void announceOnlineOnce() {
   if (onlineAnnounced) return;
-  char msg[224];
-  snprintf(msg, sizeof(msg),
-    "Reconnected to WiFi. Boot #%lu, last reset: %s, free heap %u B.",
-    (unsigned long)bootCount, gResetReason, (unsigned)ESP.getFreeHeap());
-  if (sendNtfy(C.ntfyStatus.c_str(), "Tapout restarted",
-               msg, "low", "white_check_mark")) {
-    onlineAnnounced = true;
-  }
+  serviceRestartReport();
 }
 
 // Boot-time D4 self-test: if the detector read LOW at startup it is miswired,
@@ -597,7 +752,7 @@ static void serviceStuckLine() {
 
   if (!low) {                                  // line idle (HIGH) -> healthy
     if (lineStuckWarned && WiFi.status() == WL_CONNECTED) {
-      if (sendNtfy(C.ntfyStatus.c_str(), "Detector line recovered",
+      if (logStatus("Detector line recovered",
                    "D4 returned to idle (HIGH). The ring line is no longer stuck active.",
                    "default", "white_check_mark")) {
         lineStuckWarned = false;
@@ -620,7 +775,7 @@ static void serviceStuckLine() {
     "call. Likely the ELK-930 is miswired/shorted/stuck, or tip/ring isn't connected "
     "so the open-collector output isn't sitting idle-HIGH. Verify the detector. (Bell stays primary.)",
     (unsigned long)(LINE_STUCK_MS / 1000));
-  if (sendNtfy(C.ntfyStatus.c_str(), "Detector line STUCK active", msg, "high", "warning")) {
+  if (logStatus("Detector line STUCK active", msg, "high", "warning")) {
     lineStuckWarned = true;
   }
 }
@@ -642,7 +797,8 @@ static void serviceHeapCheck() {
              "Heap pressure: free %u B, largest block %u B. TLS alerts may start "
              "failing; consider a scheduled power-cycle.",
              (unsigned)h, (unsigned)largest);
-    sendNtfy(C.ntfyStatus.c_str(), "Low memory", m, "high", "warning");
+    boxEvent(EV_LOW_HEAP, (uint16_t)(largest / 1024));
+    logStatus("Low memory", m, "high", "warning");
     lowHeapWarned = true;
   } else if (h > LOW_HEAP_CLEAR && largest > 24000) {
     lowHeapWarned = false;
@@ -659,7 +815,7 @@ static void serviceCredWarn() {
     return;
   }
   if (WiFi.status() != WL_CONNECTED) return;       // retry once WiFi is up
-  if (sendNtfy(C.ntfyStatus.c_str(), "Default passwords in use",
+  if (logStatus("Default passwords in use",
                "OTA reflash and the admin reboot/send-test/provision actions are "
                "DISABLED: the web_pass and/or ota_pass NVS fields are still the "
                "shipped CHANGE-ME defaults. Re-provision (POST /provision or the "
@@ -670,10 +826,41 @@ static void serviceCredWarn() {
 }
 
 // ===================== NEVER-LOSE-A-CALL QUEUE =========================
-// Sends the CALL alert; on failure leaves callPending true to retry, and after
-// CALL_MAX_ATTEMPTS surfaces a delivery-failure on the STATUS topic so a ring
-// is never silently lost.
+// Sends the CALL alert; on failure leaves callPending true to retry until
+// CALL_STALE_MS after the ring (a later pre-alert is useless: dispatch has paged),
+// then drops it and logs that on the STATUS topic, so a ring is never silently lost.
 static void fireCallAlert(bool simulated) {
+  // Too late to be useful: the real dispatch page has gone out. Drop it, log it.
+  if ((int32_t)(millis() - callExpireMs) >= 0) {
+    if (simulated) {                       // a stale [TEST]/[SIM] must not page hours later either
+      callPending = false;
+      logStatus("Simulated ring expired", "The simulated ring could not be sent within 2 min (network down); "
+                "it was dropped rather than paged late.", "default", "test_tube");
+      return;
+    }
+    char ts[48];
+    char why[120];
+    if (callAttempts == 0)
+      snprintf(why, sizeof(why), "No send was possible: WiFi was down the whole time");
+    else
+      snprintf(why, sizeof(why), "%u failed attempt%s while WiFi was up (first error HTTP %d, last HTTP %d), "
+               "i.e. the internet / ntfy.sh was unreachable",
+               (unsigned)callAttempts, callAttempts == 1 ? "" : "s", callFirstFailCode, callLastFailCode);
+    if (callRingEpoch) { time_t t = (time_t)callRingEpoch; struct tm lt; localtime_r(&t, &lt);
+                         strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S %Z", &lt); }
+    else snprintf(ts, sizeof(ts), "(time unknown)");
+    snprintf(expiredNote, sizeof(expiredNote),
+      "The pre-alert for the %s ring was NOT sent: it could not be delivered within %lu min, and by then "
+      "the real dispatch page has gone out. %s.",
+      ts, (unsigned long)(CALL_STALE_MS / 60000UL), why);
+    callPending = false;
+    callRestoredEpoch = 0;
+    boxClearCall();
+    lastExpiredNoteTryMs = 0;
+    Serial.println(F("[ring] CALL alert dropped as stale (> CALL_STALE_MS)"));
+    statusError();
+    return;
+  }
   // NEVER burn a retry attempt when there is no link. sendNtfy() would return
   // false immediately without a real POST, so counting it would exhaust all
   // CALL_MAX_ATTEMPTS within ~60 s and SILENTLY drop a real call during any
@@ -682,18 +869,27 @@ static void fireCallAlert(bool simulated) {
   // genuine HTTP failures while actually CONNECTED.
   if (WiFi.status() != WL_CONNECTED) return;
 
+  // The CREW message is ALWAYS the standard alert -- "Incoming call on the station
+  // line at <when the phone rang>." -- whether it goes out first try, on a retry,
+  // or after a restart. Delivery/health detail (late, retried, restored) never
+  // goes on the CALL topic: it is reported on STATUS after delivery (below).
+  // (v2.0.9 switched to "Phone rang ~Ns ago ... (alert delayed by network)" on a
+  // retry, which leaked network-health detail into the crew channel.)
+  // Clock not synced when the phone rang but synced since (WiFi was probably
+  // down): back-fill the ring time from uptime. Never put the uptime/"clock not
+  // synced" form on the crew channel -- that is health detail.
+  if (!callRingEpoch && !callRestoredEpoch && timeSynced())
+    callRingEpoch = (uint32_t)time(nullptr) - (millis() - callDetectedMs) / 1000;
   char ts[48];
-  formatTimestamp(ts, sizeof(ts));
-  uint32_t ageS = (millis() - callDetectedMs) / 1000;
-  char msg[224];
-  if (ageS < 3) {
-    snprintf(msg, sizeof(msg),
-      "Incoming call on the station line at %s.", ts);
+  if (callRingEpoch) {
+    time_t t = (time_t)callRingEpoch; struct tm lt; localtime_r(&t, &lt);
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S %Z", &lt);   // same format as formatTimestamp()
   } else {
-    snprintf(msg, sizeof(msg),
-      "Phone rang ~%lus ago at %s (alert delayed by network).",
-      (unsigned long)ageS, ts);
+    ts[0] = 0;                                                 // time unknown: bare standard alert
   }
+  char msg[224];
+  if (ts[0]) snprintf(msg, sizeof(msg), "Incoming call on the station line at %s.", ts);
+  else       snprintf(msg, sizeof(msg), "Incoming call on the station line.");
 
   // Real ring: byte-identical to v1.1.0 (CALL topic, max priority).
   // Simulation: same message body (so the full TLS POST path is exercised) but
@@ -724,9 +920,20 @@ static void fireCallAlert(bool simulated) {
     }
   }
 
-  if (sendNtfy(url, title, msg, prio, tags)) {
+  const int failCode = callLastFailCode; // error from this call's previous failed attempt (for the STATUS note)
+  const bool wasRestored = callRestoredEpoch && !simulated;
+  crewSendOpen = true;                   // the ONLY place allowed to post to the CALL topic
+  const bool sent = sendNtfy(url, title, msg, prio, tags);
+  crewSendOpen = false;
+  if (!sent) {
+    callLastFailCode = lastNtfyCode;
+    if (callAttempts == 0) callFirstFailCode = lastNtfyCode;      // logged on STATUS later
+  }
+  if (sent) {
     callPending = false;                 // delivered
     if (!simulated) {
+      boxClearCall();                    // delivered: nothing to re-send after a restart
+      callRestoredEpoch = 0;
       // The unambiguous "it worked for real" milestone -- persisted so it
       // survives reboots and can NEVER be confused with a simulation.
       realCallsDelivered++;
@@ -736,16 +943,44 @@ static void fireCallAlert(bool simulated) {
       esp_task_wdt_reset();
       Serial.printf("[ring] CALL alert delivered (real_calls_delivered=%lu)\n",
                     (unsigned long)realCallsDelivered);
+      // Late / retried / restored delivery: say so on STATUS -- the crew got the
+      // standard alert above. (Captured before the restored flag is cleared.)
+      uint32_t lateS = (millis() - callDetectedMs) / 1000;
+      if (wasRestored || callAttempts > 0 || lateS >= 3) {
+        char note[260];
+        char after[40] = "";
+        time_t wall = time(nullptr);
+        if (callRingEpoch && wall > (time_t)callRingEpoch)
+          snprintf(after, sizeof(after), ", ~%lu min after the ring", (unsigned long)((wall - callRingEpoch + 59) / 60));
+        if (wasRestored)
+          snprintf(note, sizeof(note), "The crew alert for the %s ring was delivered after a device restart%s. "
+                   "The crew got the standard alert.", ts[0] ? ts : "(time unknown)", after);
+        else if (callAttempts > 0)
+          snprintf(note, sizeof(note), "The FIRST send of the crew alert for the %s ring failed (HTTP %d). "
+                   "It went out %lus late on attempt %u%s. The crew got the standard alert.",
+                   ts, callFirstFailCode, (unsigned long)lateS, (unsigned)callAttempts + 1,
+                   callAttempts > 1 ? (failCode != callFirstFailCode ? " (later errors differed)" : "") : "");
+        else
+          snprintf(note, sizeof(note), "The crew alert for the %s ring went out %lus after the ring "
+                   "(WiFi was down or the send was slow). The crew got the standard alert.", ts, (unsigned long)lateS);
+        logStatus(callAttempts > 0 ? "Crew alert: first send failed" : "Crew alert delivered late",
+                 note, "default", "hourglass");
+      }
     } else {
       Serial.println(F("[sim] simulated ring alert delivered"));
     }
-  } else if (++callAttempts >= CALL_MAX_ATTEMPTS) {
-    callPending = false;                 // give up; surface on STATUS
-    Serial.println(F("[ring] CALL alert FAILED after retries"));
-    sendNtfy(C.ntfyStatus.c_str(), "ALERT DELIVERY FAILED",
-             "A ring was detected but the CALL alert could not be delivered "
-             "after retries. Check WiFi / outbound 443 to ntfy.sh.",
-             "high", "warning");
+  } else if (callAttempts < 255 && ++callAttempts >= CALL_MAX_ATTEMPTS && simulated) {
+    callPending = false;                 // give up (simulations only); surface on STATUS
+    Serial.println(F("[sim] simulated alert FAILED after retries"));
+    {
+      char m[260];
+      snprintf(m, sizeof(m), "A SIMULATED ring (%s) could not be delivered: %u attempts over %lu min "
+               "(first error HTTP %d, last HTTP %d). WiFi was up, so the internet / outbound 443 to "
+               "ntfy.sh was likely down.",
+               ts[0] ? ts : "time unknown", (unsigned)callAttempts,
+               (unsigned long)((millis() - callDetectedMs) / 60000UL), callFirstFailCode, callLastFailCode);
+      logStatus("ALERT DELIVERY FAILED", m, "high", "warning");
+    }
     statusError();
   } else {
     Serial.printf("[ring] CALL alert retry %u/%u pending\n",
@@ -753,10 +988,12 @@ static void fireCallAlert(bool simulated) {
   }
 }
 
-// Non-blocking retry pump; gated on CALL_RETRY_MS so it never spins.
+// Non-blocking retry pump: every CALL_RETRY_MS for the first CALL_MAX_ATTEMPTS
+// tries, then every CALL_SLOW_RETRY_MS; a real call expires CALL_STALE_MS after the ring.
 static void serviceCallQueue() {
   if (!callPending) return;
-  if (millis() - lastCallTryMs < CALL_RETRY_MS) return;
+  uint32_t gap = callAttempts < CALL_MAX_ATTEMPTS ? CALL_RETRY_MS : CALL_SLOW_RETRY_MS;
+  if (millis() - lastCallTryMs < gap) return;
   lastCallTryMs = millis();
   fireCallAlert(callSimulated);   // retries keep the original real/sim routing
 }
@@ -770,6 +1007,7 @@ static void setupOTA() {
   // Default OTA port 3232 (TCP) -- left default so the flash command is simple.
 
   ArduinoOTA.onStart([]() {
+    noteReboot("ArduinoOTA reflash (attended, over WiFi)");
     otaInProgress = true;
     // A flash erase/write can block far longer than the 30 s WDT. Detach the
     // dog for the duration so a legitimate upload can't panic-reset mid-write.
@@ -793,6 +1031,7 @@ static void setupOTA() {
   });
 
   ArduinoOTA.onError([](ota_error_t error) {
+    { Preferences bp; bp.begin("fhabox", false); bp.remove("why"); bp.remove("why_boot"); bp.end(); }
     Serial.printf("[ota] ERROR %u -- aborting, keeping old image\n", error);
     // Upload failed: NO reboot, old firmware keeps running. Re-arm the dog we
     // detached in onStart so normal protection resumes.
@@ -892,6 +1131,7 @@ static void handleRoot() {
   server.sendContent(F("<div class='card'>"));
   if (!wifiUp)                            server.sendContent(F("<span class='pill bad'>WiFi DOWN</span>"));
   else if (digitalRead(RING_PIN) == LOW) server.sendContent(F("<span class='pill bad'>RINGING NOW</span>"));
+  else if (!ringDet.armed)               server.sendContent(F("<span class='pill warn'>Arming -- waiting for 3 s of idle line</span>"));
   else                                   server.sendContent(F("<span class='pill ok'>Idle -- armed</span>"));
   if (callPending)                       server.sendContent(F(" <span class='pill warn'>CALL alert retrying</span>"));
   if (!timeSynced())                     server.sendContent(F(" <span class='pill warn'>NTP not synced</span>"));
@@ -923,6 +1163,11 @@ static void handleRoot() {
     row(F("Largest free block"), v);
   }
   row(F("Real CALL alerts delivered (lifetime)"), String((unsigned long)realCallsDelivered));
+  row(F("Ring mode"), C.ringMode == RD_MODE_PATTERN
+      ? String(F("pattern &mdash; pages on the 2nd ring"))
+      : String(F("single &mdash; pages once a ring lasts ")) + C.ringMinMs + F(" ms"));
+  row(F("Ignored line activity (not a ring)"),
+      String((unsigned long)ignoredActivity) + (ringDet.armed ? F("") : F(" &mdash; detector arming (line must be idle 3 s)")));
   row(F("Boot count"),    String(bootCount));
   row(F("Last reset"),    String(gResetReason));
   {
@@ -1025,7 +1270,7 @@ static void handleStatusJson() {
 
   // Single machine-checkable verdict + fault list. An external monitor can alarm
   // on healthy==false OR on this page going unreachable.
-  bool healthy = wifiUp && timeSynced() && !frag && !lowHeapWarned && !detectorStuck;
+  bool healthy = wifiUp && timeSynced() && !frag && !lowHeapWarned && !detectorStuck && ringDet.armed;
   server.sendContent(String(F(",\"healthy\":")) + (healthy ? "true" : "false"));
   server.sendContent(F(",\"faults\":["));
   {
@@ -1041,6 +1286,7 @@ static void handleStatusJson() {
     if (lowHeapWarned)  fault("low_heap");
     if (detectorStuck)  fault("detector_stuck");
     if (g_onProbation)  fault("ota_probation");
+    if (!ringDet.armed) fault("detector_unarmed");
   }
   server.sendContent(F("]"));
 
@@ -1067,6 +1313,45 @@ static void handleStatusJson() {
     else
       server.sendContent(F(",\"running_image_version\":\"\""));
   }
+
+  // Ring-pattern detector: armed yet? how much non-ring activity was ignored?
+  {
+    uint32_t ign, gl, lastIgn, lastLen; BurstRec bl[BURSTLOG_N]; uint8_t bc, bh;
+    portENTER_CRITICAL(&ringMux);
+    ign = ignoredActivity; gl = glitchCount; lastIgn = lastIgnoredMs; lastLen = lastIgnoredLenMs;
+    memcpy(bl, burstLog, sizeof(bl)); bc = burstLogCount; bh = burstLogHead;
+    portEXIT_CRITICAL(&ringMux);
+    const uint32_t now = millis();      // AFTER the copy, so "ago" can't underflow
+    server.sendContent(String(F(",\"ring_armed\":")) + (ringDet.armed ? "true" : "false"));
+    server.sendContent(String(F(",\"ring_sampler\":\"")) + (ringTimerOk ? "timer" : "loop") + "\"");
+    server.sendContent(String(F(",\"ring_mode\":\"")) + (C.ringMode == RD_MODE_PATTERN ? "pattern" : "single") + "\"");
+    server.sendContent(String(F(",\"ring_min_ms\":")) + String((unsigned long)C.ringMinMs));
+    server.sendContent(String(F(",\"ignored_line_activity\":")) + String((unsigned long)ign));
+    server.sendContent(String(F(",\"line_glitches\":")) + String((unsigned long)gl));
+    server.sendContent(String(F(",\"last_ignored_ms_ago\":")) + String(lastIgn ? (now - lastIgn) : 0));
+    server.sendContent(String(F(",\"last_ignored_longest_ms\":")) + String((unsigned long)lastLen));
+    // Newest first: how long ago each burst (>= 30 ms) started and how long it
+    // lasted -- gaps follow from consecutive ago_ms. For checking real-call and
+    // real-replug timing in the field.
+    server.sendContent(F(",\"recent_bursts\":["));
+    for (uint8_t i = 0; i < bc; i++) {
+      const BurstRec& b = bl[(bh + BURSTLOG_N - 1 - i) % BURSTLOG_N];
+      if (i) server.sendContent(F(","));
+      server.sendContent(String(F("{\"ago_ms\":")) + String((unsigned long)(now - b.startMs))
+                         + F(",\"len_ms\":") + String((unsigned long)b.lenMs) + F("}"));
+    }
+    server.sendContent(F("]"));
+  }
+
+  // ---- Black box / self-heal ----
+  server.sendContent(String(F(",\"restart_why\":\"")) + rebootWhy + "\"");
+  server.sendContent(String(F(",\"restart_reported\":")) + (restartReported ? "true" : "false"));
+  server.sendContent(String(F(",\"wifi_drops\":")) + String((unsigned)wifiDrops));
+  server.sendContent(String(F(",\"last_disconnect_reason\":")) + String((unsigned)lastDiscReason));
+  server.sendContent(String(F(",\"net_ok_ms_ago\":")) + String(netEverOk ? (millis() - lastNetOkMs) : 0));
+  server.sendContent(String(F(",\"net_fail_probes\":")) + String((unsigned)netFailProbes));
+  server.sendContent(String(F(",\"heal_streak\":")) + String((unsigned long)healStreak));
+  server.sendContent(String(F(",\"crash_dump_pending\":")) + (crashPending ? "true" : "false"));
 
   // ring_log streamed per-event (no large String). MUST be the last field.
   server.sendContent(F(",\"ring_log\":{\"count\":"));
@@ -1107,6 +1392,7 @@ static void handleSendTest() {
 // POST /reboot (auth, DEFERRED so the handler never blocks the watchdog).
 static void handleReboot() {
   if (!requireAuth()) return;
+  strncpy(pendingRebootWhy, "web /reboot button", sizeof(pendingRebootWhy) - 1);
   pendingRebootMs = millis() + 600;       // reboot shortly after replying
   server.send(200, "text/plain", "Rebooting in ~1s...\n");
 }
@@ -1193,15 +1479,27 @@ static void provisionFromArgs() {
   if (server.hasArg("ntp1"))         saveField("ntp1",         server.arg("ntp1"));
   if (server.hasArg("ntp2"))         saveField("ntp2",         server.arg("ntp2"));
   if (server.hasArg("ntp3"))         saveField("ntp3",         server.arg("ntp3"));
-  if (server.hasArg("deadman"))      saveField("deadman",      server.arg("deadman"));
+  if (server.hasArg("deadman")) {    // applied live: no reboot needed to start/stop check-ins
+    saveField("deadman", server.arg("deadman"));
+    C.deadman = server.arg("deadman");
+  }
   if (server.hasArg("ota_manifest")) saveField("ota_manifest", server.arg("ota_manifest"));
   if (server.hasArg("ota_enabled"))  cfg.putBool("ota_enabled",  server.arg("ota_enabled") == "1");
   // Clamp to a sane floor/ceiling: toInt() yields 0 for blank/non-numeric input,
   // which would make the loop scheduler run otaCheckManifest() every pass.
   if (server.hasArg("ota_interval")) cfg.putUInt("ota_interval", clampOtaInterval((uint32_t)server.arg("ota_interval").toInt()));
+  if (server.hasArg("ring_mode")) {           // "single" (default) | "pattern"
+    C.ringMode = server.arg("ring_mode") == "pattern" ? RD_MODE_PATTERN : RD_MODE_SINGLE;
+    cfg.putUChar("ring_mode", C.ringMode);
+  }
+  if (server.hasArg("ring_min_ms")) {
+    C.ringMinMs = clampRingMinMs((uint32_t)server.arg("ring_min_ms").toInt());
+    cfg.putUInt("ring_min_ms", C.ringMinMs);
+  }
   cfg.putBool("provisioned", true);
   cfg.end();
   esp_task_wdt_reset();                              // NVS commit can take a few ms
+  applyRingConfig();                                 // ring mode takes effect immediately
 }
 
 // GET / in SETUP MODE -- the SoftAP provisioning form. Password fields render
@@ -1236,6 +1534,8 @@ static void handleSetupForm() {
     "<label>OTA manifest url (optional)</label><input name='ota_manifest' placeholder='https://raw.githubusercontent.com/...'>"
     "<label>Enable auto pull-OTA? (1=yes,0=no)</label><input name='ota_enabled' value='0'>"
     "<label>OTA check interval (minutes)</label><input name='ota_interval' value='360'>"
+    "<label>Ring mode: single = page on the 1st ring (default), pattern = only on a 2-ring pattern</label>"
+    "<input name='ring_mode' value='single'>"
     "<button type='submit'>Save &amp; reboot</button></form>"
     "<p class='sub'>After saving, the device reboots and joins your WiFi.</p>"
     "</div></body></html>"));
@@ -1274,6 +1574,7 @@ static void startSetupPortal() {
   server.on("/save", HTTP_POST, [](){
     provisionFromArgs();
     server.send(200, "text/plain", "Saved. Rebooting...\n");
+    noteReboot("setup portal: new settings saved");
     delay(300);
     ESP.restart();
   });
@@ -1377,9 +1678,11 @@ static bool otaEnabledAndSafe() {
 // passes from the first boot onward while still refusing to update from an
 // UNDEFINED/PENDING image that could not serve as a fallback.
 static bool otaSafeToStart() {
+  if (otaState != PULL_OTA_IDLE) return false;                         // already staged, waiting to reboot
   if (callPending) return false;                                       // a call is latched/in-flight
   if (digitalRead(RING_PIN) == LOW) return false;                      // line active right now
-  if (millis() - lastRingActiveMs < RING_REARM_IDLE_MS) return false;  // just rang
+  { uint32_t act = lastRingActiveMs;   // read BEFORE millis(): the 5 ms sampler may update it concurrently
+    if (millis() - act < RING_REARM_IDLE_MS) return false; }           // just rang
   if (WiFi.status() != WL_CONNECTED) return false;
   if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < TLS_MIN_CONTIG_BLOCK) return false;
   const esp_partition_t* run = esp_ota_get_running_partition();
@@ -1491,7 +1794,7 @@ static bool otaDownloadAndFlash(const String& url, size_t totalSize /* firmware 
   if (!verifyImageSignature(imgHash, sigBuf, SIG_TRAILER_SIZE)) {
     Serial.println(F("[ota] signature verification FAILED -- rejecting image"));
     Update.abort();
-    sendNtfy(C.ntfyStatus.c_str(), "OTA REJECTED",
+    logStatus("OTA REJECTED",
              "Bad signature on pulled image -- ignored, running image untouched.",
              "high", "warning");
     otaState = PULL_OTA_IDLE;
@@ -1518,7 +1821,7 @@ static bool otaDownloadAndFlash(const String& url, size_t totalSize /* firmware 
   if (semver(otaPendingVer) <= semver(FW_VERSION)) {
     otaNote("rejected: manifest version not newer than running");
     Update.abort();
-    sendNtfy(C.ntfyStatus.c_str(), "OTA REJECTED",
+    logStatus("OTA REJECTED",
              (String("Manifest ") + otaPendingVer + " not newer than running "
               + FW_VERSION + " -- ignored.").c_str(), "high", "warning");
     otaState = PULL_OTA_IDLE;
@@ -1538,14 +1841,16 @@ static bool otaDownloadAndFlash(const String& url, size_t totalSize /* firmware 
   cfg.putString("ota_pend_ver", otaPendingVer);
   cfg.end();
   otaState = PULL_OTA_PENDING_REBOOT;
-  sendNtfy(C.ntfyStatus.c_str(), "OTA staged",
+  logStatus("OTA staged",
            (String("v") + otaPendingVer + " downloaded + signature verified + written to the "
             "standby slot. Rebooting into a 60s health trial...").c_str(),
            "default", "arrows_counterclockwise");
   Serial.println(F("[ota] staged + verified -- rebooting into trial"));
-  delay(500);
-  ESP.restart();
-  return true;                   // not reached
+  // Reboot via loop()'s deferred-reboot handler, which holds while a real call is
+  // confirmed/in flight (a direct ESP.restart() here would wipe it).
+  snprintf(pendingRebootWhy, sizeof(pendingRebootWhy), "OTA update to v%s", otaPendingVer);
+  pendingRebootMs = millis() + 500;
+  return true;
 }
 
 // Fetch the manifest, gate on semver + min_supported, then download+flash.
@@ -1604,7 +1909,7 @@ static void otaCheckManifest() {
   }
   if (minv.length() && semver(FW_VERSION) < semver(minv)) {
     Serial.printf("[ota] manifest requires >= %s, refusing skip from %s\n", minv.c_str(), FW_VERSION);
-    sendNtfy(C.ntfyStatus.c_str(), "OTA skipped",
+    logStatus("OTA skipped",
              (String("Update ") + ver + " needs min_supported " + minv + " > running " + FW_VERSION).c_str(),
              "default", "warning");
     return;
@@ -1614,11 +1919,11 @@ static void otaCheckManifest() {
   otaPendingVer[sizeof(otaPendingVer) - 1] = 0;
   char m[110]; snprintf(m, sizeof(m), "v%s found (running v%s) -- downloading the signed image...", ver.c_str(), FW_VERSION);
   otaNote(m);
-  sendNtfy(C.ntfyStatus.c_str(), "OTA update found", m, "default", "arrow_down");
+  logStatus("OTA update found", m, "default", "arrow_down");
   if (!otaDownloadAndFlash(url, sz)) {     // returns ONLY on failure (success reboots into the new image)
     char f[100]; snprintf(f, sizeof(f), "download/flash of %s FAILED (rejected/timeout/size) -- staying on %s", ver.c_str(), FW_VERSION);
     otaNote(f);
-    sendNtfy(C.ntfyStatus.c_str(), "OTA FAILED", f, "high", "warning");
+    logStatus("OTA FAILED", f, "high", "warning");
   }
 }
 
@@ -1635,7 +1940,8 @@ static void handleCheckOta() {
   bool keyReal     = !looksLikePlaceholder((const char*)PUBLIC_KEY) && PUBLIC_KEY_LEN > 64;
   bool callP       = callPending;
   bool ringActive  = (digitalRead(RING_PIN) == LOW);
-  bool justRang    = (millis() - lastRingActiveMs < RING_REARM_IDLE_MS);
+  uint32_t lastAct = lastRingActiveMs;  // read before millis() (sampler writes it concurrently)
+  bool justRang    = (millis() - lastAct < RING_REARM_IDLE_MS);
   bool wifi        = (WiFi.status() == WL_CONNECTED);
   bool heapOk      = (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= TLS_MIN_CONTIG_BLOCK);
   const esp_partition_t* run = esp_ota_get_running_partition();
@@ -1675,7 +1981,7 @@ static void handleCheckOta() {
   // no-update / gate-blocked manual checks -- the JSON response already says so).
   if (wouldUpdate) {
     char p[128]; snprintf(p, sizeof(p), "Manual check: v%s available -> starting update from v%s", mver.c_str(), FW_VERSION);
-    sendNtfy(C.ntfyStatus.c_str(), "OTA check (manual)", p, "default", "mag");
+    logStatus("OTA check (manual)", p, "default", "mag");
   }
 
   String j = String(F("{\"current\":\"")) + FW_VERSION + "\",\"gates\":{";
@@ -1750,7 +2056,7 @@ static void otaServiceProbation() {
       cfg.remove("ota_failed_ver");                 // this version proved healthy -> clear any stale marker
       cfg.end();
       C.otaFailedVer = "";
-      sendNtfy(C.ntfyStatus.c_str(), "Update successful",
+      logStatus("Update successful",
                (String("Successfully updated and trialed firmware v") + FW_VERSION +
                 " -- passed the 60s health trial and committed (no rollback). Now running v"
                 + FW_VERSION + ".").c_str(),
@@ -1761,6 +2067,10 @@ static void otaServiceProbation() {
   }
 
   if ((int32_t)(millis() - trialDeadlineMs) >= 0) {
+    // A real call confirmed/in flight: hold the rollback so the restart doesn't wipe
+    // it -- but only briefly. This image failed because it can't reach ntfy, so the
+    // call may never deliver from here; after 2 min, roll back regardless.
+    if ((int32_t)(millis() - trialDeadlineMs) < 120000 && realCallInFlight()) return;
     Serial.println(F("[ota] probation FAILED -- rolling back"));
     // Remember THIS version (the trial image's own FW_VERSION) as failed BEFORE we
     // revert, so the rolled-back old image refuses to re-stage it next interval and
@@ -1768,12 +2078,556 @@ static void otaServiceProbation() {
     cfg.begin("fhacfg", false);
     cfg.putString("ota_failed_ver", FW_VERSION);
     cfg.end();
-    sendNtfy(C.ntfyStatus.c_str(), "OTA rolled back",
+    logStatus("OTA rolled back",
              (String("Firmware v") + FW_VERSION + " FAILED its 60s health trial "
               "(WiFi/ntfy unreachable) -- auto-reverted to the previous good image.").c_str(),
              "high", "warning");
+    {
+      char why[72];
+      snprintf(why, sizeof(why), "OTA rollback: v%s failed its 60 s health trial", FW_VERSION);
+      noteReboot(why);
+    }
     delay(200);
     esp_ota_mark_app_invalid_rollback_and_reboot();   // REVERT to previous good slot (no return)
+  }
+}
+
+// ==================== BLACK BOX + SELF-HEAL (v2.0.10) ==================
+// Why: the unit has needed manual reboots a few times and nothing recorded what
+// happened. Now:
+//   * A small flight recorder (checkpoint + last BOX_EVENTS events) is kept in
+//     RTC memory (survives crash / watchdog / software resets; refreshed every
+//     minute) AND in NVS (survives power loss; written every 5 min and before
+//     every intentional restart).
+//   * Every intentional restart records WHY first. After any restart, the first
+//     thing sent once WiFi is back is a "Tapout restarted" report on STATUS:
+//     cause (requested / power cut / brownout / crash / watchdog hang), how long
+//     it was down, what it looked like just before (heap, WiFi, signal, last
+//     successful send, failure streak) and the recent events. Unexpected causes
+//     go out at HIGH priority. A saved crash dump is summarised in a second
+//     "crash report" message, then erased.
+//   * Self-heal: "WiFi connected but nothing gets through" was invisible to the
+//     old code (it only reconnected when WiFi reported DISconnected) and the
+//     watchdog stays happy, so the unit just went dark. Now a cheap probe runs
+//     whenever nothing has succeeded for 5 min: 3 failed probes -> force a WiFi
+//     reconnect; 5 -> reboot. WiFi down 15 min -> reboot (backing off to 30, 60,
+//     120 min while the outage continues). Each heal is logged and reported.
+//   * A real call that was detected but not yet delivered is saved, so a restart
+//     can't silently eat it: it is re-sent after boot (marked delayed) if under
+//     10 min old, else reported on STATUS.
+
+
+static uint32_t boxCrc(const BoxRec& r) {   // FNV-1a over everything but the crc
+  const uint8_t* p = (const uint8_t*)&r;
+  uint32_t h = 2166136261u;
+  for (size_t i = 0; i < offsetof(BoxRec, crc); i++) { h ^= p[i]; h *= 16777619u; }
+  return h;
+}
+static bool boxValid(const BoxRec& r) {
+  return r.magic == BOX_MAGIC && r.version == BOX_VERSION && r.count <= BOX_EVENTS
+      && r.head < BOX_EVENTS && r.crc == boxCrc(r);
+}
+
+static void boxFillCp() {
+  BoxCp& c = box.cp;
+  time_t now = time(nullptr);
+  c.epoch      = now > TIME_VALID_EPOCH ? (uint32_t)now : 0;
+  c.upS        = millis() / 1000;
+  c.bootCount  = bootCount;
+  c.freeHeap   = ESP.getFreeHeap();
+  c.largest    = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  c.minFree    = esp_get_minimum_free_heap_size();
+  c.sinceOkS   = netEverOk ? (millis() - lastNetOkMs) / 1000 : 0xFFFFFFFFu;
+  c.ringCount  = ringCount;
+  c.wifiDrops  = wifiDrops;
+  c.lastDisc   = lastDiscReason;
+  c.wifiUp     = WiFi.status() == WL_CONNECTED;
+  c.rssi       = c.wifiUp ? (int8_t)WiFi.RSSI() : 0;
+  c.failStreak = netFailStreak;
+}
+static void boxSyncRtc() {                  // cheap: RAM copy, no flash wear
+  box.crc = boxCrc(box);
+  memcpy(&boxRtc, &box, sizeof(box));
+}
+static void boxPersist() {
+  boxFillCp();
+  boxSyncRtc();
+  Preferences p;
+  p.begin("fhabox", false);
+  p.putBytes("rec", &box, sizeof(box));
+  p.end();
+  lastBoxNvsMs = millis();
+  esp_task_wdt_reset();
+}
+static void boxEvent(uint8_t code, uint16_t arg) {
+  time_t now = time(nullptr);
+  BoxEvt& e = box.ev[box.head];
+  e.epoch = now > TIME_VALID_EPOCH ? (uint32_t)now : 0;
+  e.upS   = millis() / 1000;
+  e.code  = code;
+  e.pad   = 0;
+  e.arg   = arg;
+  box.head = (box.head + 1) % BOX_EVENTS;
+  if (box.count < BOX_EVENTS) box.count++;
+  boxFillCp();
+  boxSyncRtc();
+}
+
+// Record why we are about to restart (read back by the next boot), then flush.
+static void noteReboot(const char* why) {
+  Preferences p;
+  p.begin("fhabox", false);
+  p.putString("why", why);
+  p.putUInt("why_boot", bootCount);         // only trusted by the very next boot
+  p.end();
+  boxEvent(EV_REBOOT_REQ, 0);
+  boxPersist();
+  Serial.printf("[box] restarting: %s\n", why);
+}
+
+// Network health bookkeeping, called by sendNtfy()/httpGetBounded().
+static void netOk() {
+  lastNetOkMs = millis();
+  netEverOk = true;
+  netFailStreak = 0;
+  netFailProbes = 0;                        // any real success ends a "connected but dead" episode
+  healStreak = 0;                           // healthy again: next outage starts the backoff fresh
+}
+static void netFail(int code) {
+  if (WiFi.status() != WL_CONNECTED) return;          // offline failures are WiFi's story
+  // arg: HTTP status, or 0x8000|-code for HTTPClient's negative transport errors
+  if (netFailStreak == 0) boxEvent(EV_SEND_FAIL, code < 0 ? (uint16_t)(0x8000 | ((-code) & 0x7FFF)) : (uint16_t)code);
+  if (netFailStreak < 255) netFailStreak++;
+}
+
+// A real call latched: persist so a restart can't silently drop it (paged after
+// boot only if still within CALL_STALE_MS of the ring).
+static void boxSaveCall() {
+  if (inSetupMode) return;                  // portal: nothing can be delivered; don't carry test rings over
+  time_t now = time(nullptr);
+  Preferences p;
+  p.begin("fhabox", false);
+  p.putUInt("pcall", now > TIME_VALID_EPOCH ? (uint32_t)now : 1);   // 1 = time unknown
+  p.remove("pcall_force");
+  p.end();
+  boxEvent(EV_CALL, 0);
+}
+// Clear the saved call -- only if it is still the one we think it is (a newer
+// call may have replaced it in the meantime).
+static void boxClearCallIf(uint32_t expect) {
+  Preferences p;
+  p.begin("fhabox", false);
+  if (expect == 0 || p.getUInt("pcall", 0) == expect) { p.remove("pcall"); p.remove("pcall_force"); }
+  p.end();
+}
+static void boxClearCall() { boxClearCallIf(0); }
+
+static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) lastDiscReason = info.wifi_sta_disconnected.reason;
+}
+
+// Called early in setup(): load what the previous boot left, start this boot's record.
+static void boxBoot() {
+  Preferences p;
+  p.begin("fhabox", true);
+  BoxRec nv = {};
+  bool nvOk = p.getBytes("rec", &nv, sizeof(nv)) == sizeof(nv) && boxValid(nv);
+  String why = p.getString("why", "");
+  uint32_t whyBoot = p.getUInt("why_boot", 0);
+  savedCallEpoch = p.getUInt("pcall", 0);
+  savedCallForce = p.getBool("pcall_force", false);
+  p.end();
+
+  bool rtcOk = boxValid(boxRtc);
+  // RTC is fresher (updated every minute) but only survives non-power-on resets.
+  if (rtcOk && (!nvOk || boxRtc.cp.bootCount > nv.cp.bootCount
+                || (boxRtc.cp.bootCount == nv.cp.bootCount && boxRtc.cp.upS >= nv.cp.upS))) {
+    boxPrev = boxRtc; boxPrevFromRtc = true; boxPrevValid = true;
+  } else if (nvOk) {
+    boxPrev = nv; boxPrevValid = true;
+  }
+  // A recorded reason explains THIS restart only if the previous boot wrote it AND
+  // the chip actually did a software restart (a crash/hang/power cut after a
+  // reason was written -- e.g. a failed OTA that didn't reboot -- must still
+  // read as unexpected).
+  if (why.length() && whyBoot + 1 == bootCount && bootReason == ESP_RST_SW) {
+    size_t o = 0;
+    for (size_t i = 0; i < why.length() && o + 1 < sizeof(rebootWhy); i++) {
+      char ch = why[i];
+      rebootWhy[o++] = (ch >= 0x20 && ch < 0x7f && ch != '"' && ch != '\\') ? ch : '\'';   // JSON/ntfy-safe
+    }
+    rebootWhy[o] = 0;
+  }
+  if (why.length()) { p.begin("fhabox", false); p.remove("why"); p.remove("why_boot"); p.end(); }
+
+  if (healMagic != BOX_MAGIC) { healMagic = BOX_MAGIC; healStreak = 0; }
+
+  // Keep the event history across boots: this boot appends to the same ring.
+  memset(&box, 0, sizeof(box));
+  if (boxPrevValid) { memcpy(box.ev, boxPrev.ev, sizeof(box.ev)); box.head = boxPrev.head; box.count = boxPrev.count; }
+  box.magic = BOX_MAGIC;
+  box.version = BOX_VERSION;
+  bootEvHead  = box.head;                   // events before this index are the previous boots'
+  bootEvPrior = box.count;
+  boxEvent(EV_BOOT, (uint16_t)bootReason);
+
+  // Crash dump from a panic / watchdog (saved to the coredump partition by the core).
+  if (esp_core_dump_image_check() == ESP_OK && esp_core_dump_get_summary(&crashSum) == ESP_OK) {
+    crashPending = true;
+    if (esp_core_dump_get_panic_reason(crashReason, sizeof(crashReason)) != ESP_OK) crashReason[0] = 0;
+  }
+  WiFi.onEvent(onWifiEvent);
+}
+
+static const char* evName(uint8_t c) {
+  switch (c) {
+    case EV_BOOT:           return "boot";
+    case EV_WIFI_LOST:      return "WiFi lost";
+    case EV_WIFI_UP:        return "WiFi up";
+    case EV_NET_DOWN:       return "no internet (WiFi up)";
+    case EV_NET_UP:         return "internet back";
+    case EV_SEND_FAIL:      return "send failed";
+    case EV_HEAL_RECONNECT: return "self-heal: WiFi reconnect";
+    case EV_HEAL_REBOOT:    return "self-heal: reboot";
+    case EV_LOW_HEAP:       return "low memory";
+    case EV_CALL:           return "call detected";
+    case EV_REBOOT_REQ:     return "restart requested";
+    default:                return "?";
+  }
+}
+static const char* discName(uint16_t r) {
+  switch (r) {
+    case 2:   return "auth expired";
+    case 3:   return "deauth by AP";
+    case 4:   return "assoc expired";
+    case 8:   return "left";
+    case 15:  return "4-way handshake timeout";
+    case 200: return "beacon timeout (AP gone/out of range)";
+    case 201: return "AP not found";
+    case 202: return "auth failed";
+    case 203: return "assoc failed";
+    case 204: return "handshake timeout";
+    case 205: return "connection failed";
+    default:  return "";
+  }
+}
+
+// "Oct 04 03:55" from an epoch, or "+3h12m up" when the clock wasn't set.
+static void fmtWhen(uint32_t epoch, uint32_t upS, char* out, size_t n) {
+  if (epoch) {
+    time_t t = (time_t)epoch; struct tm lt; localtime_r(&t, &lt);
+    strftime(out, n, "%b %d %H:%M", &lt);
+  } else {
+    snprintf(out, n, "+%luh%02lum up", (unsigned long)(upS / 3600), (unsigned long)((upS % 3600) / 60));
+  }
+}
+
+// Bounds-safe append: never lets n run past the buffer (snprintf returns the
+// would-be length, so naive "n += snprintf(...)" chains can underflow cap - n).
+static int appendf(char* buf, size_t cap, int n, const char* fmt, ...) {
+  if (n < 0 || (size_t)n >= cap - 1) return (int)cap - 1;
+  va_list ap;
+  va_start(ap, fmt);
+  int w = vsnprintf(buf + n, cap - (size_t)n, fmt, ap);
+  va_end(ap);
+  if (w < 0) return n;
+  return (size_t)(n + w) >= cap ? (int)cap - 1 : n + w;
+}
+
+// Attempt throttle shared by the one-shot reports (an ntfy that is reachable but
+// failing must not turn them into a send-every-loop-pass storm).
+static const uint32_t REPORT_RETRY_MS = 60UL * 1000UL;
+
+// The restart report: sent once per boot, as soon as WiFi is up and the clock is
+// set (or 90 s after WiFi, so a broken NTP can't hold it back forever).
+static void serviceRestartReport() {
+  static uint32_t wifiUpAtMs = 0, lastTryMs = 0;
+  if (restartReported) return;
+  // A call saved before the restart goes out FIRST: the report (one more TLS
+  // POST) must never delay a crew page. (Also reached via announceOnlineOnce.)
+  serviceSavedCall();
+  if (savedCallEpoch && !savedCallChecked) return;
+  if (WiFi.status() != WL_CONNECTED) { wifiUpAtMs = 0; return; }
+  if (!wifiUpAtMs) wifiUpAtMs = millis();
+  if (!timeSynced() && millis() - wifiUpAtMs < 90000) return;
+  if (lastTryMs && millis() - lastTryMs < REPORT_RETRY_MS) return;
+  lastTryMs = millis();
+
+  bool unexpected = true;
+  const char* cause;
+  if (rebootWhy[0]) { cause = "requested restart"; unexpected = false; }
+  else switch (bootReason) {
+    case ESP_RST_POWERON:    cause = "POWER LOSS: it was unplugged, power-cycled, the reset button was pressed, or the supply cut out"; break;
+    case ESP_RST_BROWNOUT:   cause = "BROWNOUT: the power supply sagged too low (check the USB supply/cable)"; break;
+    case ESP_RST_PWR_GLITCH: cause = "POWER GLITCH on the supply"; break;
+    case ESP_RST_PANIC:      cause = "CRASH: the firmware crashed and restarted itself"; break;
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_INT_WDT:
+    case ESP_RST_WDT:        cause = "HANG: the firmware froze and the watchdog restarted it"; break;
+    case ESP_RST_SW:         cause = "software restart with no recorded reason"; break;
+    case ESP_RST_USB:        cause = "USB reset (e.g. reflashed over the cable)"; break;
+    default:                 cause = gResetReason; break;
+  }
+  if (!boxPrevValid && !rebootWhy[0]) { cause = "first boot with the black-box recorder (no history yet)"; unexpected = false; }
+
+  static char msg[1400];
+  const size_t cap = sizeof(msg);
+  int n = appendf(msg, cap, 0, "Boot #%lu. Cause: %s%s%s%s.",
+                  (unsigned long)bootCount, cause, rebootWhy[0] ? " (" : "", rebootWhy, rebootWhy[0] ? ")" : "");
+  if (boxPrevValid) {
+    const BoxCp& c = boxPrev.cp;
+    char when[24]; fmtWhen(c.epoch, c.upS, when, sizeof(when));
+    char ofBoot[24] = "";
+    if (c.bootCount + 1 != bootCount) snprintf(ofBoot, sizeof(ofBoot), " (from boot #%lu)", (unsigned long)c.bootCount);
+    time_t now = time(nullptr);
+    if (c.epoch && now > TIME_VALID_EPOCH && (uint32_t)now > c.epoch) {
+      n = appendf(msg, cap, n, " Last sign of life %s%s (%s ago)%s.", when, ofBoot,
+                  fmtDuration(min((uint32_t)now - c.epoch, (uint32_t)(40UL * 86400UL)) * 1000UL).c_str(),
+                  boxPrevFromRtc ? "" : ", within ~5 min");
+    } else {
+      n = appendf(msg, cap, n, " Last checkpoint %s%s.", when, ofBoot);
+    }
+    char ok[32];
+    if (c.sinceOkS == 0xFFFFFFFFu) snprintf(ok, sizeof(ok), "never");
+    else snprintf(ok, sizeof(ok), "%s earlier", fmtDuration(c.sinceOkS * 1000UL).c_str());
+    n = appendf(msg, cap, n, " Just before: up %s, WiFi %s", fmtDuration(c.upS * 1000UL).c_str(), c.wifiUp ? "up" : "DOWN");
+    if (c.wifiUp) n = appendf(msg, cap, n, " %d dBm", (int)c.rssi);
+    n = appendf(msg, cap, n, ", last successful send %s, %u failures in a row, %u WiFi drops that boot",
+                ok, (unsigned)c.failStreak, (unsigned)c.wifiDrops);
+    if (c.lastDisc) n = appendf(msg, cap, n, " (last: %u %s)", (unsigned)c.lastDisc, discName(c.lastDisc));
+    n = appendf(msg, cap, n, ", heap %lu KB free (largest %lu KB, low-water %lu KB).",
+                (unsigned long)(c.freeHeap / 1024), (unsigned long)(c.largest / 1024), (unsigned long)(c.minFree / 1024));
+  }
+  // Events from BEFORE this boot, oldest first (the last 8).
+  uint8_t shown = bootEvPrior < 8 ? bootEvPrior : 8;
+  if (shown) {
+    n = appendf(msg, cap, n, " Recent events:");
+    for (uint8_t i = shown; i >= 1; i--) {
+      const BoxEvt& e = boxPrev.ev[(bootEvHead + BOX_EVENTS - i) % BOX_EVENTS];
+      char when[24]; fmtWhen(e.epoch, e.upS, when, sizeof(when));
+      n = appendf(msg, cap, n, " %s %s", when, evName(e.code));
+      if (e.code == EV_WIFI_LOST && e.arg) n = appendf(msg, cap, n, " (%u %s)", (unsigned)e.arg, discName(e.arg));
+      else if (e.code == EV_BOOT) n = appendf(msg, cap, n, " (%s)", resetReasonToStr((esp_reset_reason_t)e.arg));
+      else if (e.code == EV_SEND_FAIL)
+        n = appendf(msg, cap, n, " (HTTP %d)", (e.arg & 0x8000) ? -(int)(e.arg & 0x7FFF) : (int)e.arg);
+      n = appendf(msg, cap, n, ";");
+    }
+  }
+  if (savedCallEpoch) n = appendf(msg, cap, n, " A call was detected before the restart (see the next alert).");
+
+  if (sendNtfy(C.ntfyStatus.c_str(), unexpected ? "Tapout restarted UNEXPECTEDLY" : "Tapout restarted",
+               msg, unexpected ? "high" : "low", unexpected ? "warning,arrows_counterclockwise" : "arrows_counterclockwise")) {
+    restartReported = true;
+    onlineAnnounced = true;
+  }
+}
+
+// One-time crash summary (task, PC, backtrace). The dump may be from an EARLIER
+// firmware (v2.0.9 never erased dumps), so identify the crashed build by its ELF
+// SHA-256 prefix rather than assuming it is the running version.
+static void serviceCrashReport() {
+  static uint32_t lastTryMs = 0;
+  if (!crashPending || !restartReported || WiFi.status() != WL_CONNECTED) return;
+  if (lastTryMs && millis() - lastTryMs < REPORT_RETRY_MS) return;
+  lastTryMs = millis();
+  char runSha[APP_ELF_SHA256_SZ] = "";
+  esp_app_get_elf_sha256(runSha, sizeof(runSha));
+  const char* crashSha = (const char*)crashSum.app_elf_sha256;
+  bool thisBuild = runSha[0] && strncmp(runSha, crashSha, sizeof(runSha) - 1) == 0;
+  static char msg[640];
+  const size_t cap = sizeof(msg);
+  int n = appendf(msg, cap, 0, "A crash dump was saved%s%s. Task '%s', PC 0x%08lx, exception cause %lu, addr 0x%08lx. Backtrace%s:",
+                  crashReason[0] ? ": " : "", crashReason, crashSum.exc_task, (unsigned long)crashSum.exc_pc,
+                  (unsigned long)crashSum.ex_info.exc_cause, (unsigned long)crashSum.ex_info.exc_vaddr,
+                  crashSum.exc_bt_info.corrupted ? " (partly corrupted)" : "");
+  for (uint32_t i = 0; i < crashSum.exc_bt_info.depth && i < 16; i++)
+    n = appendf(msg, cap, n, " 0x%08lx", (unsigned long)crashSum.exc_bt_info.bt[i]);
+  if (thisBuild) n = appendf(msg, cap, n, ". Crashed build = this firmware (v%s, ELF %s): decode with its tapout.ino.elf (addr2line).", FW_VERSION, crashSha);
+  else           n = appendf(msg, cap, n, ". Crashed build ELF %s is NOT the running v%s (an earlier firmware): decode with the release whose tapout.ino.elf matches.", crashSha, FW_VERSION);
+  if (sendNtfy(C.ntfyStatus.c_str(), "Tapout crash report", msg, "high", "boom")) {
+    esp_core_dump_image_erase();             // report each crash once
+    crashPending = false;
+  }
+}
+
+// ---- STATUS log queue ---------------------------------------------------
+// STATUS is the device's log channel. A LOG message (an event or warning) must
+// not be lost to a WiFi/internet outage: logStatus() sends it now if it can,
+// otherwise queues it and serviceStatusLog() resends it, in order, once the
+// network is back -- stamped with when it was logged. HEALTH CHECKS are never
+// queued (heartbeat, dead-man check-in, connectivity probes, ping replies): a
+// stale "still alive" is meaningless. Crew alerts always go first.
+static const uint8_t  SLOG_N = 10;
+struct StatusLogMsg { uint32_t atMs, epoch; char title[48]; char body[480]; char prio[8]; char tags[32]; };
+static StatusLogMsg slog[SLOG_N];
+static uint8_t  slogHead = 0, slogCount = 0;
+static uint16_t slogDropped = 0;            // overflowed while offline (reported on the next delivered log)
+static uint32_t lastSlogTryMs = 0;
+static bool     lastSlogOk = true;
+
+static bool logStatus(const char* title, const char* body, const char* prio, const char* tags) {
+  // Nothing queued ahead of it and we're online: send now (keeps order).
+  if (slogCount == 0 && WiFi.status() == WL_CONNECTED && !callPending
+      && sendNtfy(C.ntfyStatus.c_str(), title, body, prio, tags)) return true;
+  if (slogCount == SLOG_N) { slogHead = (slogHead + 1) % SLOG_N; slogCount--; slogDropped++; }   // drop oldest
+  StatusLogMsg& e = slog[(slogHead + slogCount) % SLOG_N];
+  time_t now = time(nullptr);
+  e.atMs  = millis();
+  e.epoch = now > TIME_VALID_EPOCH ? (uint32_t)now : 0;
+  strncpy(e.title, title, sizeof(e.title) - 1); e.title[sizeof(e.title) - 1] = 0;
+  strncpy(e.body,  body,  sizeof(e.body)  - 1); e.body[sizeof(e.body) - 1]   = 0;
+  strncpy(e.prio,  prio,  sizeof(e.prio)  - 1); e.prio[sizeof(e.prio) - 1]   = 0;
+  strncpy(e.tags,  tags,  sizeof(e.tags)  - 1); e.tags[sizeof(e.tags) - 1]   = 0;
+  slogCount++;
+  Serial.printf("[log] queued for STATUS (%u waiting): %s\n", (unsigned)slogCount, title);
+  return true;                              // accepted: it WILL be delivered (or counted as dropped)
+}
+
+static void serviceStatusLog() {
+  if (!slogCount || WiFi.status() != WL_CONNECTED || callPending) return;
+  uint32_t gap = lastSlogOk ? 3000 : 30000;   // drain steadily; back off while sends fail
+  if (lastSlogTryMs && millis() - lastSlogTryMs < gap) return;
+  lastSlogTryMs = millis();
+  const StatusLogMsg& e = slog[slogHead];
+  static char body[640];
+  const size_t cap = sizeof(body);
+  int n = 0;
+  if (slogDropped) n = appendf(body, cap, n, "(%u older log message%s dropped while offline.) ",
+                               (unsigned)slogDropped, slogDropped == 1 ? " was" : "s were");
+  n = appendf(body, cap, n, "%s", e.body);
+  uint32_t lateS = (millis() - e.atMs) / 1000;
+  if (lateS >= 30) {
+    char when[24];
+    if (e.epoch) { time_t t = (time_t)e.epoch; struct tm lt; localtime_r(&t, &lt); strftime(when, sizeof(when), "%H:%M:%S", &lt); }
+    else snprintf(when, sizeof(when), "uptime %lus", (unsigned long)(e.atMs / 1000));
+    n = appendf(body, cap, n, " [logged %s, sent %s late]", when, fmtDuration(lateS * 1000UL).c_str());
+  }
+  lastSlogOk = sendNtfy(C.ntfyStatus.c_str(), e.title, body, e.prio, e.tags);
+  if (lastSlogOk) {
+    slogHead = (slogHead + 1) % SLOG_N;
+    slogCount--;
+    slogDropped = 0;
+  }
+}
+
+// STATUS log for a pre-alert dropped as stale; held until it can be sent.
+static void serviceExpiredNote() {
+  if (!expiredNote[0] || WiFi.status() != WL_CONNECTED) return;
+  if (lastExpiredNoteTryMs && millis() - lastExpiredNoteTryMs < REPORT_RETRY_MS) return;
+  lastExpiredNoteTryMs = millis();
+  if (logStatus("Pre-alert NOT sent (too late)", expiredNote, "high", "warning"))
+    expiredNote[0] = 0;
+}
+
+// Re-send (or report) a real call that was detected before the restart.
+static void serviceSavedCall() {
+  static uint32_t lastTryMs = 0;
+  static uint32_t wifiUpAtMs = 0;
+  if (!savedCallEpoch || savedCallChecked) return;
+  if (WiFi.status() != WL_CONNECTED) { wifiUpAtMs = 0; return; }
+  if (!wifiUpAtMs) wifiUpAtMs = millis();
+  // After a power cut the clock is invalid until SNTP syncs (usually seconds after
+  // WiFi). The saved epoch is real, so WAIT for the clock (bounded) rather than
+  // declaring a 25-second-old call "age unknown" and never paging it.
+  if (savedCallEpoch > 1 && !timeSynced() && millis() - wifiUpAtMs < 90000) return;
+  if (lastTryMs && millis() - lastTryMs < REPORT_RETRY_MS) return;
+  lastTryMs = millis();
+  time_t now = time(nullptr);
+  bool known = savedCallEpoch > 1 && now > TIME_VALID_EPOCH && (uint32_t)now >= savedCallEpoch;
+  uint32_t ageS = known ? (uint32_t)now - savedCallEpoch : 0;
+  // Page it only if still fresh: within CALL_STALE_MS of the ring (the clock
+  // survives a software/watchdog restart; after a power cut the age is unknown).
+  if (known && ageS < RESTORED_CALL_MAX_S) {
+    savedCallChecked = true;
+    callRestoredEpoch = savedCallEpoch;        // STATUS gets the "delivered after a restart" note
+    callRingEpoch  = savedCallEpoch > 1 ? savedCallEpoch : 0;
+    callFirstFailCode = 0;
+    callLastFailCode  = 0;
+    callPending    = true;
+    callSimulated  = false;
+    callAttempts   = 0;
+    callDetectedMs = millis();
+    callExpireMs   = millis() + (RESTORED_CALL_MAX_S - ageS) * 1000UL;   // deadline is from the RING
+    lastCallTryMs  = millis();
+    fireCallAlert(false);
+    return;                                    // key cleared on delivery / expiry
+  }
+  char when[24]; fmtWhen(known ? savedCallEpoch : 0, 0, when, sizeof(when));
+  char msg[220];
+  snprintf(msg, sizeof(msg), "A real call was detected %s but its pre-alert was not delivered before the "
+           "device restarted. %s, so the crew was NOT paged now (dispatch will have paged).",
+           known ? when : "(time unknown)", known ? "It is older than 2 min" : "Its age is unknown");
+  if (logStatus("Undelivered call before restart", msg, "high", "warning")) {
+    savedCallChecked = true;
+    boxClearCallIf(savedCallEpoch);            // only if no newer call replaced it
+  }
+}
+
+// Self-restart for healing; never during OTA trial/download. Any just-confirmed
+// ring is handed to the pipeline (and so saved) first; after boot it is paged only
+// if still within CALL_STALE_MS of the ring, else logged on STATUS.
+static void selfHealReboot(const char* why) {
+  if (g_onProbation || otaState != PULL_OTA_IDLE || otaInProgress) return;
+  (void)realCallInFlight();                    // hands over ringPagesPending -> boxSaveCall
+  healStreak++;
+  boxEvent(EV_HEAL_REBOOT, 0);
+  noteReboot(why);
+  delay(100);
+  ESP.restart();
+}
+
+// Loop hook: black-box checkpoints, WiFi edge events, connectivity probe, self-heal.
+static void serviceBlackBox() {
+  static bool wasUp = false;
+  const bool up = (WiFi.status() == WL_CONNECTED);
+  if (up != wasUp) {
+    if (up) {
+      boxEvent(EV_WIFI_UP, (uint16_t)(-WiFi.RSSI()));
+      wifiDownSinceMs = 0;
+    } else {
+      wifiDrops++;
+      boxEvent(EV_WIFI_LOST, lastDiscReason);
+    }
+    wasUp = up;
+  }
+  if (millis() - lastBoxRtcMs >= BOX_RTC_MS) { lastBoxRtcMs = millis(); boxFillCp(); boxSyncRtc(); }
+  if (millis() - lastBoxNvsMs >= BOX_NVS_MS) boxPersist();
+
+  if (up) {
+    // Probe only when nothing has succeeded for a while (normal sends count).
+    bool quiet = !netEverOk || millis() - lastNetOkMs >= NET_PROBE_MS;
+    if (!quiet || (lastProbeMs && millis() - lastProbeMs < NET_PROBE_MS)) return;
+    lastProbeMs = millis();
+    const uint8_t failedBefore = netFailProbes;            // netOk() inside the GET clears it
+    if (httpGetBounded((C.ntfyStatus + "/json?poll=1&since=1s").c_str())) {   // no message is created
+      if (failedBefore) boxEvent(EV_NET_UP, failedBefore);
+      netFailProbes = 0;                       // (netOk() also clears it)
+      return;
+    }
+    netFailProbes++;
+    if (netFailProbes == 1) boxEvent(EV_NET_DOWN, 0);
+    if (netFailProbes == NET_HEAL_RECONNECT) {
+      boxEvent(EV_HEAL_RECONNECT, 0);
+      Serial.println(F("[heal] WiFi up but nothing gets through -- forcing a reconnect"));
+      WiFi.disconnect();
+      WiFi.begin(C.wifiSsid.c_str(), C.wifiPass.c_str());
+      // Keep serviceWifi() from immediately tearing this reconnect down again.
+      lastWifiAttempt = millis();
+      wifiBackoffMs   = 15000;
+    } else if (netFailProbes >= NET_HEAL_REBOOT) {
+      selfHealReboot("self-heal: WiFi said connected but nothing got through for ~25 min");
+    }
+  } else {
+    // NOTE: netFailProbes is deliberately NOT reset here -- the self-heal reconnect
+    // itself drops WiFi briefly, and resetting would loop reconnects forever
+    // without ever reaching the reboot. Only a real success (netOk) clears it.
+    if (!wifiDownSinceMs) wifiDownSinceMs = millis();
+    uint32_t limit = WIFI_DOWN_REBOOT_MS << (healStreak < 3 ? healStreak : 3);
+    if (millis() - wifiDownSinceMs >= limit) {
+      char why[80];
+      snprintf(why, sizeof(why), "self-heal: WiFi down for %lu min", (unsigned long)(limit / 60000));
+      selfHealReboot(why);
+    }
   }
 }
 
@@ -1798,8 +2652,12 @@ void setup() {
   // ---- Persistent ring log (restore history across reboot/brownout) ------
   loadRingLog();
 
+  // ---- Black box: load what the previous boot left, start this boot's record
+  boxBoot();
+
   // ---- Runtime config from NVS (secrets live here, not in the image) -----
   loadConfig();
+  applyRingConfig();            // ring mode / min length from NVS (before the sampler starts)
 
   // ---- RAIL B: if we just booted a freshly-flashed image, start the 60 s
   //      health-probation clock NOW (committed/rolled-back later in loop). ---
@@ -1815,6 +2673,7 @@ void setup() {
   // Ring input: idle HIGH, ELK-930 pulls LOW during a ring.
   pinMode(RING_PIN, INPUT_PULLUP);
   delay(50);   // let the internal pull-up settle before any read (avoids a transient-LOW false alarm)
+  startRingSampler();           // 5 ms D4 sampler (arms after 3 s idle; see ring_detect.h)
   // No boot-time D4 read here: serviceStuckLine() monitors continuously and only
   // warns if the line stays active past LINE_STUCK_MS, so a brief startup transient
   // never false-fires and a genuinely stuck line is caught at boot OR any time after.
@@ -1896,7 +2755,10 @@ void setup() {
     if (!requireAuth()) return;               // fail-closed on CHANGE-ME web_pass
     provisionFromArgs();
     server.send(200, "application/json", "{\"ok\":true}");
-    if (server.arg("reboot") == "1") pendingRebootMs = millis() + 600;  // reuse deferred reboot
+    if (server.arg("reboot") == "1") {                 // reuse deferred reboot
+      strncpy(pendingRebootWhy, "settings changed via /provision", sizeof(pendingRebootWhy) - 1);
+      pendingRebootMs = millis() + 600;
+    }
   });
   server.on("/check-ota",   HTTP_POST, handleCheckOta);   // manual OTA trigger + gate diagnosis
   server.onNotFound(handleNotFound);
@@ -1939,6 +2801,14 @@ void loop() {
   serviceStuckLine();           // continuous detector "stuck active" monitor
   serviceCredWarn();            // one-shot default-password warning
   serviceHeapCheck();           // low-heap canary (throttled)
+  serviceIgnoredActivity();     // STATUS note for non-ring line activity (throttled)
+  serviceArmCheck();            // STATUS warning if ring detection never armed
+  serviceSavedCall();           // re-send a real call saved before a restart (before STATUS reports)
+  serviceExpiredNote();         // log a pre-alert dropped as stale (> 2 min)
+  serviceStatusLog();           // resend queued STATUS logs once the network is back (not health checks)
+  serviceRestartReport();       // once per boot: why it restarted + what it looked like before
+  serviceCrashReport();         // once: summary of a saved crash dump
+  serviceBlackBox();            // checkpoints, WiFi events, connectivity probe, self-heal
   serviceDeadman();             // external check-in, withheld when degraded (opt-in)
   server.handleClient();        // serve status page / json / actions (fast)
 
@@ -1961,9 +2831,11 @@ void loop() {
     if (WiFi.status() == WL_CONNECTED) statusConnected(); else statusError();
   }
 
-  // Deferred reboot (set by /reboot) -- lets the HTTP reply flush first.
-  if (pendingRebootMs && (int32_t)(millis() - pendingRebootMs) >= 0) {
+  // Deferred reboot (/reboot, OTA staged) -- lets the HTTP reply flush first.
+  if (pendingRebootMs && (int32_t)(millis() - pendingRebootMs) >= 0
+      && !realCallInFlight()) {                // hold while a real call is confirmed / being delivered
     Serial.println(F("[web] reboot requested"));
+    noteReboot(pendingRebootWhy);
     delay(50);
     ESP.restart();
   }
@@ -2005,39 +2877,164 @@ static void serviceWifi() {
 }
 
 // ---------------------- Ring detection ----------------------------------
+// D4 is sampled every 5 ms by an esp_timer (ringSample), NOT by loop(): loop()
+// blocks for seconds at a time in TLS sends, and sampling there left holes that
+// could hide or split real rings. ring_detect.h decides what is a ring (see the
+// rules there). Detection arms only after the line has read idle 3 s since boot,
+// so the D4 blip at boot / on a power replug can never page. Then:
+//   ring_mode=single (default): page once ONE ring has lasted ring_min_ms -- the
+//     station line may ring only once before the call rolls to dispatch.
+//   ring_mode=pattern (opt-in): page only on a 2-ring pattern (single blips of
+//     any length can't page; costs the 1st ring).
+// Activity that doesn't page is reported on STATUS as ignored. The bell stays primary.
+//
+// Dedup (one call = one alert) is decided HERE, from continuous samples, so a slow
+// CALL POST can't make the sampler miss the ringing and re-page the same call.
+static void ringSample() {
+  const bool low = (digitalRead(RING_PIN) == LOW);
+  const uint32_t now = millis();
+  portENTER_CRITICAL(&ringMux);
+  const uint32_t burstsBefore = ringDet.burstsSeen;
+  RdEvent ev = ringStep(&ringDet, low, now);
+
+  // "Line active" for OTA gating + call dedup: >= 30 ms of activity (a lone 5 ms
+  // glitch on a noisy line shouldn't hold off OTA or re-arming forever).
+  if (low && ringDet.armed && ringDet.inBurst && now - ringDet.burstStart >= 30) lastRingActiveMs = now;
+  if (!low && now - lastRingActiveMs >= RING_REARM_IDLE_MS) idleSinceAlert = true;
+
+  if (ringDet.burstsSeen != burstsBefore && ringDet.lastBurstLen >= 30) {
+    burstLog[burstLogHead] = { ringDet.lastBurstStart, ringDet.lastBurstLen };
+    burstLogHead = (burstLogHead + 1) % BURSTLOG_N;
+    if (burstLogCount < BURSTLOG_N) burstLogCount++;
+  }
+
+  if (ev == RD_RING) {
+    // COOLDOWN_MS remains an absolute ceiling so a line that keeps ringing re-alerts.
+    bool newCall = !everAlerted || idleSinceAlert || (now - lastAlertMs >= COOLDOWN_MS);
+    if (newCall) {
+      lastAlertMs    = now;
+      everAlerted    = true;
+      idleSinceAlert = false;
+      ringPagesPending++;
+      ringPageAtMs   = now;
+    }
+  } else if (ev == RD_IGNORED) {
+    ignoredActivity++;
+    ignoredPending++;
+    lastIgnoredMs     = now;
+    lastIgnoredLenMs  = ringDet.ignoredMs;
+    lastIgnoredBursts = ringDet.ignoredBursts;
+  } else if (ev == RD_GLITCH) {
+    glitchCount++;
+  }
+  portEXIT_CRITICAL(&ringMux);
+}
+
+static void ringTimerCb(void*) { ringSample(); }
+
+// Push the configured ring mode / threshold into the detector (live; under the
+// sampler's lock so a mode change can't land mid-step).
+static void applyRingConfig() {
+  portENTER_CRITICAL(&ringMux);
+  ringDet.mode  = C.ringMode;
+  ringDet.minMs = C.ringMinMs;
+  portEXIT_CRITICAL(&ringMux);
+}
+
+// Start the 5 ms sampler. If the timer can't start, loop() samples inline
+// (the pre-2.0.10 behaviour, still pattern-checked) and STATUS says so.
+static void startRingSampler() {
+  const esp_timer_create_args_t args = {
+    .callback = ringTimerCb,
+    .arg = nullptr,
+    .dispatch_method = ESP_TIMER_TASK,
+    .name = "ring",
+    .skip_unhandled_events = true,
+  };
+  ringTimerOk = esp_timer_create(&args, &ringTimer) == ESP_OK
+             && esp_timer_start_periodic(ringTimer, 5000) == ESP_OK;
+  Serial.println(ringTimerOk ? F("[ring] 5 ms sampler running")
+                             : F("[ring] sampler timer FAILED -- sampling from loop()"));
+}
+
+// loop()-side: hand confirmed calls to the alert pipeline. Cheap; call it often
+// (loop, OTA download pump, setup portal).
 static void handleRing() {
-  if (digitalRead(RING_PIN) != LOW) { ringArmed = true; return; }   // idle HIGH -> arm + nothing to do
+  if (!ringTimerOk) ringSample();
+  uint32_t pages, at, ign;
+  portENTER_CRITICAL(&ringMux);
+  pages = ringPagesPending; ringPagesPending = 0;
+  at    = ringPageAtMs;
+  ign   = ignoredPending;   ignoredPending   = 0;
+  portEXIT_CRITICAL(&ringMux);
 
-  // Do NOT trust a LOW until the line has been seen idle (HIGH) at least once
-  // since boot. This rejects the brief boot-time D4 transient, a stuck line, and
-  // an unconnected detector -- none of them can ever false-page the crew. Once a
-  // genuine idle has been observed, normal ring detection arms.
-  if (!ringArmed) return;
+  if (ign) {
+    ignoredPingPending = true;
+    Serial.println(F("[ring] ignored line activity (not a ring pattern)"));
+  }
+  if (pages) {
+    ringDetectedAtMs = at;
+    triggerRingPipeline(/*simulated=*/false);
+  }
+}
 
-  // Debounce: confirm the line is still pulled low.
-  delay(DEBOUNCE_MS);
-  esp_task_wdt_reset();
-  if (digitalRead(RING_PIN) != LOW) return;   // glitch, ignore
+// True while a REAL call is confirmed but not yet handed to the pipeline, or still
+// being delivered. Every intentional restart checks this first: a reboot wipes the
+// RAM-only call latch AND the sampler's pending page, so the crew would never hear
+// about that call (and the detector would have to re-arm and see 2 more rings).
+static bool realCallInFlight() {
+  handleRing();                         // hand any confirmed page to the pipeline first
+  return callPending && !callSimulated;
+}
 
-  uint32_t now = millis();
-  uint32_t idleGap = now - lastRingActiveMs;   // how long the line was idle (HIGH)
-  lastRingActiveMs = now;                       // the line is active right now
+// STATUS note (at most one ATTEMPT per IGNORED_PING_MS -- throttled on attempts,
+// not successes, so an ntfy outage can't turn it into a send-every-loop storm)
+// when line activity was ignored: a replug/brownout is visible without paging
+// anyone, and a real call that somehow didn't match the pattern shows up too.
+static void serviceIgnoredActivity() {
+  if (!ignoredPingPending || WiFi.status() != WL_CONNECTED || callPending) return;
+  if (lastIgnoredPingMs && millis() - lastIgnoredPingMs < IGNORED_PING_MS) return;
+  lastIgnoredPingMs  = millis();
+  ignoredPingPending = false;
+  uint32_t lenMs, bursts, count, agoS;
+  portENTER_CRITICAL(&ringMux);
+  lenMs = lastIgnoredLenMs; bursts = lastIgnoredBursts; count = ignoredActivity;
+  agoS = (millis() - lastIgnoredMs) / 1000;
+  portEXIT_CRITICAL(&ringMux);
+  char msg[360];
+  snprintf(msg, sizeof(msg),
+    "%lus ago the detector line was active (%lu burst%s, longest %lu.%lu s) without a ring "
+    "pattern, so the crew was NOT paged. Usually a power/phone-cord replug or a brownout. "
+    "If the station phone really rang then, report it: the detector may need tuning. "
+    "Ignored since boot: %lu.",
+    (unsigned long)agoS, (unsigned long)bursts, bursts == 1 ? "" : "s",
+    (unsigned long)(lenMs / 1000), (unsigned long)((lenMs % 1000) / 100), (unsigned long)count);
+  logStatus("Line activity ignored (not a ring)", msg, "default", "shield");
+}
 
-  // One call = one alert: WITHIN a call the line only goes HIGH for the short
-  // inter-ring silence (US cadence ~4 s), so those pulses fall under
-  // RING_REARM_IDLE_MS and do not re-page. A genuinely NEW call arrives after a
-  // longer idle gap and DOES page -- even just seconds after the previous one,
-  // which the old flat 60 s blackout silently dropped. COOLDOWN_MS remains an
-  // absolute ceiling so a line stuck ringing eventually re-alerts.
-  bool newCall = !everAlerted
-              || (idleGap >= RING_REARM_IDLE_MS)
-              || (now - lastAlertMs >= COOLDOWN_MS);
-  if (!newCall) return;                          // same call's cadence -> already paged
-
-  // A REAL ring updates the dedup/cooldown state, THEN runs the shared pipeline.
-  lastAlertMs = now;
-  everAlerted = true;
-  triggerRingPipeline(/*simulated=*/false);
+// Loud STATUS warning if detection hasn't armed a minute after boot (the line
+// never read idle for 3 s straight): until it arms, a real call would NOT page.
+// Attempt-throttled; re-arms the warning if it ever disarms again (it doesn't today).
+static void serviceArmCheck() {
+  static bool samplerWarned = false;
+  if (!ringTimerOk && !samplerWarned && WiFi.status() == WL_CONNECTED) {
+    samplerWarned = logStatus("Ring sampler degraded",
+      "The 5 ms ring-sampling timer failed to start, so D4 is sampled from the main loop. "
+      "Network sends can now hide or split rings. Reboot the device; report it if this repeats.",
+      "high", "warning");
+  }
+  static uint32_t lastTryMs = 0;
+  static bool     warned    = false;
+  if (ringDet.armed) { warned = false; return; }
+  if (warned || millis() < 60000 || WiFi.status() != WL_CONNECTED) return;
+  if (lastTryMs && millis() - lastTryMs < 30UL * 60UL * 1000UL) return;
+  lastTryMs = millis();
+  if (logStatus("Ring detector NOT armed",
+        "The detector line has not read idle for 3 s straight since boot, so ring detection "
+        "is not armed and a call would NOT page. Check the ELK-930 and the phone cord. "
+        "(The bell is unaffected.)", "high", "warning")) {
+    warned = true;
+  }
 }
 
 // Shared post-debounce pipeline for BOTH a real ring (handleRing) and the
@@ -2045,7 +3042,7 @@ static void handleRing() {
 // it proves the genuine record->latch->alert chain, not a parallel copy.
 //
 // CRITICAL dedup safety: the simulated path must NOT touch lastAlertMs,
-// everAlerted, or lastRingActiveMs (those stay in handleRing's real branch),
+// everAlerted, or lastRingActiveMs (those stay in ringSample's real branch),
 // so a test can never suppress a subsequent REAL ring via cooldown/re-arm.
 static void triggerRingPipeline(bool simulated) {
   uint32_t now = millis();
@@ -2056,12 +3053,28 @@ static void triggerRingPipeline(bool simulated) {
   ringLedUntil = now + RING_LED_HOLD_MS;   // non-blocking red hold (loop releases)
 
   recordRing(simulated);                   // persist to NVS log (also resets WDT)
+  if (!simulated) {
+    boxSaveCall();                         // survives a restart until delivered
+    if (savedCallEpoch && !savedCallChecked) {   // a call saved before the restart is superseded:
+      savedCallChecked = true;                   // this ring already pages, don't page twice
+      savedCallEpoch = 0;
+    }
+  }
+  callRestoredEpoch = 0;                   // a fresh ring supersedes any restored one
 
   // Latch the call and fire immediately; serviceCallQueue() retries on failure
   // so a WiFi/ntfy blip can never silently drop a real call.
   callPending    = true;
   callSimulated  = simulated;
-  callDetectedMs = now;
+  callDetectedMs = simulated ? now : ringDetectedAtMs;   // real: when the pattern was confirmed
+  callFirstFailCode = 0;
+  callLastFailCode  = 0;
+  callExpireMs   = callDetectedMs + CALL_STALE_MS;
+  {
+    time_t wall = time(nullptr);
+    uint32_t backS = (now - callDetectedMs) / 1000;      // pattern confirmed slightly before this pass
+    callRingEpoch = wall > TIME_VALID_EPOCH ? (uint32_t)(wall - backS) : 0;
+  }
   callAttempts   = 0;
   lastCallTryMs  = now;
   fireCallAlert(simulated);
@@ -2076,12 +3089,15 @@ static void handleHeartbeat() {
   char ts[48];
   formatTimestamp(ts, sizeof(ts));
   uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-  char msg[256];
+  char msg[320];
   snprintf(msg, sizeof(msg),
            "Ring detector still online (hourly check-in, seq %lu). %s. Rings since "
-           "boot: %lu. Free heap %u B, largest block %u B.",
-           (unsigned long)heartbeatSeq, ts, (unsigned long)ringCount,
-           (unsigned)ESP.getFreeHeap(), (unsigned)largest);
+           "boot: %lu (ignored non-ring line activity: %lu). Free heap %u B, largest block %u B "
+           "(low-water %u B). WiFi %d dBm, %u drops since boot.",
+           (unsigned long)heartbeatSeq, ts, (unsigned long)ringCount, (unsigned long)ignoredActivity,
+           (unsigned)ESP.getFreeHeap(), (unsigned)largest, (unsigned)esp_get_minimum_free_heap_size(),
+           (int)WiFi.RSSI(), (unsigned)wifiDrops);
+  // Health check, not a log: sent live or not at all (never queued/resent late).
   sendNtfy(C.ntfyStatus.c_str(), "Tapout heartbeat",
            msg, "min", "green_heart");
 }
@@ -2089,6 +3105,10 @@ static void handleHeartbeat() {
 // ---------------------- ntfy notification -------------------------------
 static bool sendNtfy(const char* url, const char* title, const char* message,
                      const char* priority, const char* tags) {
+  if (!crewSendOpen && C.ntfyCall.length() && strcasecmp(url, C.ntfyCall.c_str()) == 0) {
+    Serial.printf("[ntfy] REFUSED a non-alert message to the crew CALL topic: %s\n", title);
+    return false;                        // crew channel = the standard ring alert only (see crewSendOpen)
+  }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println(F("[ntfy] skipped -- WiFi down"));
     return false;
@@ -2110,6 +3130,8 @@ static bool sendNtfy(const char* url, const char* title, const char* message,
   HTTPClient http;
   if (!http.begin(client, url)) {
     Serial.println(F("[ntfy] http.begin failed"));
+    lastNtfyCode = -1;
+    netFail(-1);
     return false;
   }
   // Bound the TLS POST so a dead/slow ntfy socket can't stall ring detection
@@ -2124,12 +3146,15 @@ static bool sendNtfy(const char* url, const char* title, const char* message,
   int code = http.POST((uint8_t*)message, strlen(message));
   esp_task_wdt_reset();
   http.end();
+  lastNtfyCode = code;
 
   if (code > 0 && code < 300) {
     Serial.printf("[ntfy] sent OK (HTTP %d)\n", code);
+    netOk();
     return true;
   }
   Serial.printf("[ntfy] send failed (HTTP %d)\n", code);
+  netFail(code);
   return false;
 }
 
@@ -2149,7 +3174,9 @@ static bool httpGetBounded(const char* url) {
   esp_task_wdt_reset();
   int code = http.GET();
   http.end();
-  return (code > 0 && code < 400);
+  bool ok = (code > 0 && code < 400);
+  if (ok) netOk(); else netFail(code);
+  return ok;
 }
 
 // Periodic external check-in. Inverts the failure mode: the device cannot
@@ -2167,7 +3194,8 @@ static void serviceDeadman() {
   // Gate on real HEALTH, not merely "the loop is running".
   bool healthy = (WiFi.status() == WL_CONNECTED)
               && (digitalRead(RING_PIN) == HIGH)     // detector not stuck active
-              && (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= TLS_MIN_CONTIG_BLOCK);
+              && (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= TLS_MIN_CONTIG_BLOCK)
+              && ringDet.armed;                      // unarmed => a call would not page
   if (!healthy) return;   // withhold the check-in -> external monitor pages on silence
 
   bool ok = httpGetBounded(C.deadman.c_str());
