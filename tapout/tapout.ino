@@ -288,7 +288,7 @@ static const uint8_t  RINGLOG_N         = 20;          // events kept on flash
 static const uint8_t  RINGLOG_VERSION   = 2;           // bump if blob layout changes (v2 adds simMask)
 
 // Web identity / build stamp.
-static const char* FW_VERSION    = "2.0.12";
+static const char* FW_VERSION    = "2.0.13";
 static const char* FW_BUILD_MARK = __DATE__ " " __TIME__;
 
 // --------------------------- State --------------------------------------
@@ -2024,37 +2024,37 @@ static void handleCheckOta() {
   server.send(200, "application/json", j + "\n");
 }
 
+// WHY PROBATION NEVER RAN BEFORE v2.0.13: the Arduino core's initArduino()
+// (esp32-hal-misc.c) runs BEFORE setup(). When it finds the running image in
+// PENDING_VERIFY it calls its weak verifyOta() hook -- whose default returns
+// true -- and immediately commits the image with esp_ota_mark_app_valid_cancel_
+// rollback(). So by the time otaCheckProbationOnBoot() looked, every pulled
+// image was already VALID: the 60 s trial and auto-rollback were pre-empted on
+// every release from v2.0.0 to v2.0.12 (no "Update successful" was ever posted).
+// The core provides the opt-out: this hook makes initArduino() leave the image
+// PENDING_VERIFY so the sketch's own health trial (below) decides. It is a C
+// symbol declared only inside the core's .c file, hence extern "C".
+extern "C" bool verifyRollbackLater() { return true; }
+
 // RAIL B part 1: detect that we just booted a freshly-flashed (PENDING_VERIFY)
 // image. Called very early in setup() so the 60 s trial clock starts at boot.
 static void otaCheckProbationOnBoot() {
   const esp_partition_t* run = esp_ota_get_running_partition();
   esp_ota_img_states_t st;
   bool stOk = run && esp_ota_get_state_partition(run, &st) == ESP_OK;
-  // Arduino's Update.end() activates the slot with esp_ota_set_boot_partition(),
-  // NOT esp_ota_end(), so the bootloader never marks a pulled image PENDING_VERIFY:
-  // it boots UNDEFINED. Checking only for PENDING_VERIFY (v2.0.0-v2.0.11) meant the
-  // 60 s trial + auto-rollback NEVER ran -- every pulled image was committed VALID
-  // at boot unexamined. The reboot into a freshly staged image is flagged in NVS
-  // (ota_pending, written right before that reboot), so treat UNDEFINED + that
-  // flag as probation too. The slot is still uncommitted, so rollback works.
-  bool pendingFlag = false;
-  {
-    Preferences pp;
-    pp.begin("fhacfg", true);
-    pendingFlag = pp.getBool("ota_pending", false);
-    pp.end();
-  }
-  if (stOk && (st == ESP_OTA_IMG_PENDING_VERIFY || (st == ESP_OTA_IMG_UNDEFINED && pendingFlag))) {
+  if (stOk && st == ESP_OTA_IMG_PENDING_VERIFY) {
     g_onProbation   = true;
     trialDeadlineMs = millis() + 60000;     // 60 s to prove health
-    Serial.printf("[ota] booted %s after a pull-OTA -- on 60s health probation\n",
-                  st == ESP_OTA_IMG_PENDING_VERIFY ? "PENDING_VERIFY" : "UNDEFINED+ota_pending");
+    Serial.println(F("[ota] booted PENDING_VERIFY -- on 60s health probation"));
     return;
   }
-  if (pendingFlag) {                        // stale flag (e.g. an older firmware's reboot): clear it
+  // (v2.0.12 also accepted UNDEFINED + the NVS ota_pending flag on a wrong theory
+  //  that pulled images boot UNDEFINED; they boot PENDING_VERIFY as designed. A
+  //  stale ota_pending flag is simply cleared here.)
+  {
     Preferences pp;
     pp.begin("fhacfg", false);
-    pp.putBool("ota_pending", false);
+    if (pp.getBool("ota_pending", false)) pp.putBool("ota_pending", false);
     pp.end();
   }
   // NOT on probation: commit the running image as a VALID rollback anchor. This is
