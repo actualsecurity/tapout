@@ -1,8 +1,8 @@
 {
-  "version": "2.0.13",
-  "url": "https://github.com/actualsecurity/tapout/releases/download/v2.0.13/tapout.signed.bin",
-  "size": 1266240,
-  "sha256": "aeb0a4ac9b6f24308db7b6e6db7f51419df08ab0deaf654ff5e60863df6d2ad6",
+  "version": "2.0.14",
+  "url": "https://github.com/actualsecurity/tapout/releases/download/v2.0.14/tapout.signed.bin",
+  "size": 1273568,
+  "sha256": "f6670d4ef76d4117d9ee33dcb40acfc45b73a8c3e40f7a74ec894b0ba8ebdbd6",
   "min_supported": "2.0.0",
   "notes": "Health-gated; auto-rolls back if unhealthy within 60s."
 }
