@@ -174,6 +174,7 @@ struct Cfg {
   String   wifiSsid, wifiPass, ntfyCall, ntfyStatus, ntfyHb;
   String   otaPass, webUser, webPass, tz, ntp1, ntp2, ntp3, deadman, otaManifest;
   String   otaFailedVer;   // version that just failed health probation (skip re-stage)
+  String   ntfyToken;      // ntfy access token (reserved topics / paid quota); write-only, never echoed
   bool     otaEnabled;
   uint32_t otaIntervalMin;
   uint8_t  ringMode;       // RD_MODE_SINGLE (default: page on the 1st ring) | RD_MODE_PATTERN
@@ -194,6 +195,7 @@ static void loadConfig() {
   C.ntfyCall    = cfg.getString("ntfy_call",    DEF_NTFY_CALL);
   C.ntfyStatus  = cfg.getString("ntfy_status",  DEF_NTFY_STATUS);
   C.ntfyHb      = cfg.getString("ntfy_hb",      DEF_NTFY_HB);
+  C.ntfyToken   = cfg.getString("ntfy_token",   "");       // "" => anonymous (free tier, public topics)
   C.otaPass     = cfg.getString("ota_pass",     DEF_OTA_PASS);
   C.webUser     = cfg.getString("web_user",     DEF_WEB_USER);
   C.webPass     = cfg.getString("web_pass",     DEF_WEB_PASS);
@@ -291,7 +293,7 @@ static const uint8_t  RINGLOG_N         = 20;          // events kept on flash
 static const uint8_t  RINGLOG_VERSION   = 2;           // bump if blob layout changes (v2 adds simMask)
 
 // Web identity / build stamp.
-static const char* FW_VERSION    = "2.0.15";
+static const char* FW_VERSION    = "2.0.16";
 static const char* FW_BUILD_MARK = __DATE__ " " __TIME__;
 
 // --------------------------- State --------------------------------------
@@ -431,6 +433,7 @@ static uint32_t ntfyRefusedSinceMs = 0;  // 0 = not refused
 static uint16_t ntfyRefusedCount   = 0;
 static uint32_t ntfyRefusedCallEpoch = 0;   // a REAL crew page refused during the mute (0 = none)
 static uint32_t ntfyLastProbeMs = 0;
+static bool     ntfyAuthFailed = false;      // last refusal was 401/403 (token problem), not quota
 static const uint32_t QUOTA_PROBE_MS = 15UL * 60UL * 1000UL;
 // While ntfy is refusing publishes, every non-crew send must STOP: ntfy's limiter
 // is a slowly refilling token bucket, and the v2.0.13 device spent each refilled
@@ -1325,7 +1328,7 @@ static void handleStatusJson() {
     if (detectorStuck)  fault("detector_stuck");
     if (g_onProbation)  fault("ota_probation");
     if (!ringDet.armed) fault("detector_unarmed");
-    if (ntfyRefusedSinceMs) fault("ntfy_refusing_429");
+    if (ntfyRefusedSinceMs) fault(ntfyAuthFailed ? "ntfy_auth_rejected_403" : "ntfy_refusing_429");
   }
   server.sendContent(F("]"));
 
@@ -1394,6 +1397,7 @@ static void handleStatusJson() {
   server.sendContent(String(F(",\"last_ntfy_code\":")) + String(lastNtfyCode));
   server.sendContent(String(F(",\"ntfy_refused_for_ms\":")) + String(ntfyRefusedSinceMs ? (now - ntfyRefusedSinceMs) : 0));
   server.sendContent(String(F(",\"ntfy_refused_count\":")) + String((unsigned)ntfyRefusedCount));
+  server.sendContent(String(F(",\"ntfy_token_set\":")) + (C.ntfyToken.length() ? "true" : "false"));
 
   // ring_log streamed per-event (no large String). MUST be the last field.
   server.sendContent(F(",\"ring_log\":{\"count\":"));
@@ -1514,6 +1518,11 @@ static void provisionFromArgs() {
   if (server.hasArg("wifi_pass"))    saveField("wifi_pass",    server.arg("wifi_pass"));
   if (server.hasArg("ntfy_call"))    saveField("ntfy_call",    server.arg("ntfy_call"));
   if (server.hasArg("ntfy_status"))  saveField("ntfy_status",  server.arg("ntfy_status"));
+  if (server.hasArg("ntfy_token")) { // applied live; the ntfy account that owns the reserved topics
+    saveField("ntfy_token", server.arg("ntfy_token"));
+    C.ntfyToken = server.arg("ntfy_token");
+    ntfyRefusedSinceMs = 0;            // a new token may end a 403/429 mute: let the next send try now
+  }
   if (server.hasArg("ntfy_hb")) {    // applied live: heartbeat moves topics without a reboot
     saveField("ntfy_hb", server.arg("ntfy_hb"));
     C.ntfyHb = server.arg("ntfy_hb");
@@ -1573,6 +1582,7 @@ static void handleSetupForm() {
     "<label>ntfy CALL url (crew is paged)</label><input name='ntfy_call' placeholder='https://ntfy.sh/...'>"
     "<label>ntfy STATUS url (monitoring)</label><input name='ntfy_status' placeholder='https://ntfy.sh/...'>"
     "<label>ntfy HEARTBEAT url (optional; 1-min beats, mute it in the app)</label><input name='ntfy_hb' placeholder='https://ntfy.sh/...'>"
+    "<label>ntfy access token (needed for reserved topics / paid quota)</label><input name='ntfy_token' type='password' placeholder='tk_...'>"
     "<label>Web admin user</label><input name='web_user' value='crew'>"
     "<label>Web admin password</label><input name='web_pass' type='password'>"
     "<label>OTA (ArduinoOTA) password</label><input name='ota_pass' type='password'>"
@@ -3319,6 +3329,7 @@ static bool sendNtfy(const char* url, const char* title, const char* message,
   // or trip the 30 s watchdog (handshake + connect + read each < WDT_TIMEOUT_S).
   http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
   http.setTimeout(HTTP_READ_TIMEOUT_MS);
+  if (C.ntfyToken.length()) http.addHeader("Authorization", "Bearer " + C.ntfyToken);   // reserved topics / paid quota
   http.addHeader("Title", title);
   http.addHeader("Priority", priority);
   http.addHeader("Tags", tags);
@@ -3339,7 +3350,7 @@ static bool sendNtfy(const char* url, const char* title, const char* message,
                "last %s. Everything sent in that window was lost%s. Free-tier cap is 250 messages/day per IP.",
                (unsigned)ntfyRefusedCount, ntfyRefusedCount == 1 ? "" : "es", fmtDuration(mutedS * 1000UL).c_str(),
                ntfyRefusedCallEpoch ? " -- INCLUDING A REAL CREW PAGE" : "");
-      ntfyRefusedSinceMs = 0; ntfyRefusedCount = 0;
+      ntfyRefusedSinceMs = 0; ntfyRefusedCount = 0; ntfyAuthFailed = false;
       bool hadCall = ntfyRefusedCallEpoch != 0; ntfyRefusedCallEpoch = 0;
       logStatus(hadCall ? "ntfy quota exceeded -- CREW PAGE LOST" : "ntfy quota exceeded (now recovered)",
                 m, "high", "warning");
@@ -3347,7 +3358,12 @@ static bool sendNtfy(const char* url, const char* title, const char* message,
     return true;
   }
   Serial.printf("[ntfy] send failed (HTTP %d)\n", code);
-  if (code == 429) {
+  if (code == 403 || code == 401) {
+    // Reserved topic refusing this sender: the token is missing, wrong, or revoked.
+    // Treated like a refusal (hold + fault) so it is never silent.
+    ntfyAuthFailed = true;
+  }
+  if (code == 429 || code == 403 || code == 401) {
     if (!ntfyRefusedSinceMs) ntfyRefusedSinceMs = millis() ? millis() : 1;
     if (ntfyRefusedCount < 65535) ntfyRefusedCount++;
     if (crewSendOpen && callRingEpoch) ntfyRefusedCallEpoch = callRingEpoch;   // a real page was refused
@@ -3367,6 +3383,10 @@ static bool httpGetBounded(const char* url) {
   client.setHandshakeTimeout(TLS_HANDSHAKE_TIMEOUT_S);  // cap TLS handshake (< WDT)
   HTTPClient http;
   if (!http.begin(client, url)) return false;
+  // Same account for GETs on OUR topics (a reserved topic may be read-restricted
+  // later); never send the token to a foreign host (the dead-man URL).
+  if (C.ntfyToken.length() && (String(url).startsWith(C.ntfyStatus) || String(url).startsWith(C.ntfyCall)))
+    http.addHeader("Authorization", "Bearer " + C.ntfyToken);
   http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
   http.setTimeout(HTTP_READ_TIMEOUT_MS);
   esp_task_wdt_reset();
