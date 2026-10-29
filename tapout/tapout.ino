@@ -115,6 +115,7 @@ static const char* DEF_WIFI_SSID    = "CHANGE-ME";
 static const char* DEF_WIFI_PASS    = "";
 static const char* DEF_NTFY_CALL    = "https://ntfy.sh/CHANGE-ME";
 static const char* DEF_NTFY_STATUS  = "https://ntfy.sh/CHANGE-ME";
+static const char* DEF_NTFY_HB      = "";   // dedicated 1-min heartbeat topic ("" = heartbeat stays on STATUS, 6-hourly)
 static const char* DEF_OTA_PASS     = "CHANGE-ME";   // ArduinoOTA (attended LAN reflash) password
 static const char* DEF_WEB_USER     = "crew";
 static const char* DEF_WEB_PASS     = "CHANGE-ME";   // web admin (reboot/send-test/provision) password
@@ -164,7 +165,7 @@ static inline uint32_t clampRingMinMs(uint32_t v) {
 // ---- Runtime config struct (populated from NVS "fhacfg" by loadConfig) -------
 static Preferences cfg;                       // NVS namespace "fhacfg"  (<=15 chars)
 struct Cfg {
-  String   wifiSsid, wifiPass, ntfyCall, ntfyStatus;
+  String   wifiSsid, wifiPass, ntfyCall, ntfyStatus, ntfyHb;
   String   otaPass, webUser, webPass, tz, ntp1, ntp2, ntp3, deadman, otaManifest;
   String   otaFailedVer;   // version that just failed health probation (skip re-stage)
   bool     otaEnabled;
@@ -186,6 +187,7 @@ static void loadConfig() {
   C.wifiPass    = cfg.getString("wifi_pass",    DEF_WIFI_PASS);
   C.ntfyCall    = cfg.getString("ntfy_call",    DEF_NTFY_CALL);
   C.ntfyStatus  = cfg.getString("ntfy_status",  DEF_NTFY_STATUS);
+  C.ntfyHb      = cfg.getString("ntfy_hb",      DEF_NTFY_HB);
   C.otaPass     = cfg.getString("ota_pass",     DEF_OTA_PASS);
   C.webUser     = cfg.getString("web_user",     DEF_WEB_USER);
   C.webPass     = cfg.getString("web_pass",     DEF_WEB_PASS);
@@ -226,7 +228,14 @@ static const uint32_t COOLDOWN_MS         = 60UL * 1000UL;  // absolute re-alert
 // this still merge into one alert; COOLDOWN_MS stays as an absolute ceiling so a
 // line stuck ringing eventually re-alerts.
 static const uint32_t RING_REARM_IDLE_MS  = 8000;
-static const uint32_t HEARTBEAT_MS        = 60UL * 60UL * 1000UL;  // hourly
+// Heartbeat: every HB_FAST_MS on the dedicated heartbeat topic when one is
+// provisioned (mute that topic; it exists so a silent death is noticed in minutes,
+// not hours), else every HB_SLOW_MS on STATUS so STATUS stays events-only.
+static const uint32_t HB_FAST_MS          = 60UL * 1000UL;          // 1 min
+static const uint32_t HB_SLOW_MS          = 6UL * 60UL * 60UL * 1000UL;  // 6 h
+static inline bool hbDedicated() { return C.ntfyHb.startsWith("https://") && !looksLikePlaceholder(C.ntfyHb.c_str()); }
+static inline uint32_t heartbeatPeriodMs() { return hbDedicated() ? HB_FAST_MS : HB_SLOW_MS; }
+#define HEARTBEAT_MS heartbeatPeriodMs()
 static const uint32_t WDT_TIMEOUT_S       = 30;             // watchdog timeout (seconds)
 static const uint32_t WIFI_BACKOFF_MIN_MS = 1000;          // reconnect backoff floor
 static const uint32_t WIFI_BACKOFF_MAX_MS = 60UL * 1000UL; // reconnect backoff ceiling
@@ -276,7 +285,7 @@ static const uint8_t  RINGLOG_N         = 20;          // events kept on flash
 static const uint8_t  RINGLOG_VERSION   = 2;           // bump if blob layout changes (v2 adds simMask)
 
 // Web identity / build stamp.
-static const char* FW_VERSION    = "2.0.10";
+static const char* FW_VERSION    = "2.0.11";
 static const char* FW_BUILD_MARK = __DATE__ " " __TIME__;
 
 // --------------------------- State --------------------------------------
@@ -1256,6 +1265,8 @@ static void handleStatusJson() {
   server.sendContent(String(F(",\"ringing_now\":"))    + (digitalRead(RING_PIN) == LOW ? "true" : "false"));
   server.sendContent(String(F(",\"heartbeat_ms_ago\":")) + String(now - lastHeartbeatMs));
   server.sendContent(String(F(",\"heartbeat_seq\":")) + String((unsigned long)heartbeatSeq));
+  server.sendContent(String(F(",\"heartbeat_topic\":\"")) + (hbDedicated() ? "dedicated" : "status") + "\"");
+  server.sendContent(String(F(",\"heartbeat_period_s\":")) + String((unsigned long)(HEARTBEAT_MS / 1000)));
   server.sendContent(String(F(",\"real_calls_delivered\":")) + String((unsigned long)realCallsDelivered));
 
   // TLS-readiness telemetry: the largest CONTIGUOUS free block is the predictive
@@ -1472,6 +1483,11 @@ static void provisionFromArgs() {
   if (server.hasArg("wifi_pass"))    saveField("wifi_pass",    server.arg("wifi_pass"));
   if (server.hasArg("ntfy_call"))    saveField("ntfy_call",    server.arg("ntfy_call"));
   if (server.hasArg("ntfy_status"))  saveField("ntfy_status",  server.arg("ntfy_status"));
+  if (server.hasArg("ntfy_hb")) {    // applied live: heartbeat moves topics without a reboot
+    saveField("ntfy_hb", server.arg("ntfy_hb"));
+    C.ntfyHb = server.arg("ntfy_hb");
+    lastHeartbeatMs = 0;            // beat on the new topic right away
+  }
   if (server.hasArg("ota_pass"))     saveField("ota_pass",     server.arg("ota_pass"));
   if (server.hasArg("web_user"))     saveField("web_user",     server.arg("web_user"));
   if (server.hasArg("web_pass"))     saveField("web_pass",     server.arg("web_pass"));
@@ -1525,6 +1541,7 @@ static void handleSetupForm() {
     "<label>WiFi password</label><input name='wifi_pass' type='password'>"
     "<label>ntfy CALL url (crew is paged)</label><input name='ntfy_call' placeholder='https://ntfy.sh/...'>"
     "<label>ntfy STATUS url (monitoring)</label><input name='ntfy_status' placeholder='https://ntfy.sh/...'>"
+    "<label>ntfy HEARTBEAT url (optional; 1-min beats, mute it in the app)</label><input name='ntfy_hb' placeholder='https://ntfy.sh/...'>"
     "<label>Web admin user</label><input name='web_user' value='crew'>"
     "<label>Web admin password</label><input name='web_pass' type='password'>"
     "<label>OTA (ArduinoOTA) password</label><input name='ota_pass' type='password'>"
@@ -2056,11 +2073,15 @@ static void otaServiceProbation() {
       cfg.remove("ota_failed_ver");                 // this version proved healthy -> clear any stale marker
       cfg.end();
       C.otaFailedVer = "";
-      logStatus("Update successful",
-               (String("Successfully updated and trialed firmware v") + FW_VERSION +
-                " -- passed the 60s health trial and committed (no rollback). Now running v"
-                + FW_VERSION + ".").c_str(),
-               "default", "white_check_mark,tada");
+      // The verdict goes out DIRECTLY and, if that fails, via the log queue: it
+      // must never be silently lost (v2.0.10's was, see 2026-10-28 23:56).
+      {
+        String m = String("Successfully updated and trialed firmware v") + FW_VERSION +
+                   " -- passed the 60s health trial and committed (no rollback). Now running v"
+                   + FW_VERSION + ".";
+        if (!sendNtfy(C.ntfyStatus.c_str(), "Update successful", m.c_str(), "default", "white_check_mark,tada"))
+          logStatus("Update successful", m.c_str(), "default", "white_check_mark,tada");
+      }
       Serial.println(F("[ota] probation PASSED -- image committed"));
       return;
     }
@@ -2776,7 +2797,7 @@ void setup() {
     statusError();
   }
 
-  lastHeartbeatMs = millis();   // start the hourly timer from boot
+  lastHeartbeatMs = 0;          // first beat as soon as WiFi is up (then on the period)
   lastHeapCheckMs = millis();   // start the heap-check timer from boot
 }
 
@@ -3082,23 +3103,36 @@ static void triggerRingPipeline(bool simulated) {
 
 // ---------------------- Hourly heartbeat --------------------------------
 static void handleHeartbeat() {
-  if (millis() - lastHeartbeatMs < HEARTBEAT_MS) return;
+  if (lastHeartbeatMs && millis() - lastHeartbeatMs < HEARTBEAT_MS) return;
+  if (WiFi.status() != WL_CONNECTED || callPending) return;   // never ahead of a crew alert
   lastHeartbeatMs = millis();
-  heartbeatSeq++;               // monotonic -> a gap on STATUS reveals a missed beat
-  Serial.println(F("[heartbeat] hourly ping"));
-  char ts[48];
-  formatTimestamp(ts, sizeof(ts));
+  heartbeatSeq++;               // monotonic -> a gap reveals a missed beat
+  const bool dedicated = hbDedicated();
   uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   char msg[320];
-  snprintf(msg, sizeof(msg),
-           "Ring detector still online (hourly check-in, seq %lu). %s. Rings since "
-           "boot: %lu (ignored non-ring line activity: %lu). Free heap %u B, largest block %u B "
-           "(low-water %u B). WiFi %d dBm, %u drops since boot.",
-           (unsigned long)heartbeatSeq, ts, (unsigned long)ringCount, (unsigned long)ignoredActivity,
-           (unsigned)ESP.getFreeHeap(), (unsigned)largest, (unsigned)esp_get_minimum_free_heap_size(),
-           (int)WiFi.RSSI(), (unsigned)wifiDrops);
+  if (dedicated) {
+    // Compact 1-min beat: enough to see health trends when you do look.
+    snprintf(msg, sizeof(msg),
+             "seq %lu, up %s, %s, WiFi %d dBm (%u drops), heap %u KB (largest %u KB), rings %lu, "
+             "ring mode %s%s, OTA: %s",
+             (unsigned long)heartbeatSeq, fmtDuration(millis()).c_str(),
+             ringDet.armed ? "armed" : "NOT ARMED", (int)WiFi.RSSI(), (unsigned)wifiDrops,
+             (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(largest / 1024), (unsigned long)ringCount,
+             C.ringMode == RD_MODE_PATTERN ? "pattern" : "single", g_onProbation ? ", ON OTA TRIAL" : "",
+             otaLastResult);
+  } else {
+    char ts[48];
+    formatTimestamp(ts, sizeof(ts));
+    snprintf(msg, sizeof(msg),
+             "Ring detector still online (6-hourly check-in, seq %lu). %s. Rings since "
+             "boot: %lu (ignored non-ring line activity: %lu). Free heap %u B, largest block %u B "
+             "(low-water %u B). WiFi %d dBm, %u drops since boot.",
+             (unsigned long)heartbeatSeq, ts, (unsigned long)ringCount, (unsigned long)ignoredActivity,
+             (unsigned)ESP.getFreeHeap(), (unsigned)largest, (unsigned)esp_get_minimum_free_heap_size(),
+             (int)WiFi.RSSI(), (unsigned)wifiDrops);
+  }
   // Health check, not a log: sent live or not at all (never queued/resent late).
-  sendNtfy(C.ntfyStatus.c_str(), "Tapout heartbeat",
+  sendNtfy(dedicated ? C.ntfyHb.c_str() : C.ntfyStatus.c_str(), "Tapout heartbeat",
            msg, "min", "green_heart");
 }
 

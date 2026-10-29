@@ -130,7 +130,8 @@ These all still work in v2.0.0 and run **before** any of the new code each loop:
   pipeline to the STATUS topic, tagged `[SIM]`, without paging the crew.
 - **Hardware task watchdog** (`esp_task_wdt`, 30 s) fed every loop and during
   long operations (including the OTA download).
-- **Hourly heartbeat** ping and **onboard RGB status LED**.
+- **Heartbeat** on a dedicated topic every minute (v2.0.11; mute it in the app),
+  or 6-hourly on STATUS if no heartbeat topic is set, and **onboard RGB status LED**.
 
 ### RGB status LED (onboard, active-low)
 
@@ -203,7 +204,8 @@ HTTP Basic Auth as the other admin endpoints and never echoes secrets back.
 |---|---|---|---|
 | `wifi_ssid` / `wifi_pass` | `wifi_ssid` / `wifi_pass` | `CHANGE-ME` / "" | IoT-VLAN WiFi creds |
 | `ntfy_call` | `ntfy_call` | `https://ntfy.sh/CHANGE-ME` | crew CALL topic |
-| `ntfy_status` | `ntfy_status` | `https://ntfy.sh/CHANGE-ME` | monitoring STATUS topic |
+| `ntfy_status` | `ntfy_status` | `https://ntfy.sh/CHANGE-ME` | monitoring STATUS topic (events + logs) |
+| `ntfy_hb` | `ntfy_hb` | "" (off) | dedicated heartbeat topic: a compact beat every 60 s; applied live, no reboot. Leave empty for a 6-hourly beat on STATUS |
 | `web_user` / `web_pass` | `web_user` / `web_pass` | `crew` / `CHANGE-ME` | Basic Auth for admin endpoints |
 | `ota_pass` | `ota_pass` | `CHANGE-ME` | ArduinoOTA (attended LAN reflash) password |
 | `tz` | `tz` | `EST5EDT,M3.2.0,M11.1.0` | POSIX TZ; handles DST |
@@ -538,11 +540,13 @@ Two ntfy topics, so real calls don't get lost in monitoring noise:
 | Topic | Receives | Who subscribes |
 |-------|----------|----------------|
 | `ntfy_call` | **Real ring alerts only** (max priority, timestamped) | the crew |
-| `ntfy_status` | Boot/restart pings, hourly heartbeat, errors, canary warnings, **OTA lifecycle** (staged/committed/rolled-back/rejected) | whoever monitors uptime |
+| `ntfy_status` | Restart reports, errors, canary warnings, delivery logs, **OTA lifecycle** (staged/committed/rolled-back/rejected); a 6-hourly heartbeat only if `ntfy_hb` is unset | whoever monitors uptime |
+| `ntfy_hb` | A compact heartbeat every 60 s (uptime, armed, RSSI, heap, OTA state). Mute this topic in the app and open it only when you want to know the unit is alive *right now* | you, muted |
 
 - **Default: ntfy.sh** — HTTPS POST to `https://ntfy.sh/<topic>`; subscribe in the
-  free ntfy app. The hourly heartbeat on the status topic is the silent-failure
-  canary — if it stops, the device is offline.
+  free ntfy app. The 1-minute heartbeat topic is the silent-failure canary: if
+  it stops, the device is offline, and you know within a minute rather than an
+  hour. (`curl -u crew:<pass> -d ntfy_hb=https://ntfy.sh/<topic> http://<device>/provision` sets it live.)
 - **Alternative: Pushover** — emergency priority 2 re-alerts until acked; a
   commented `sendPushover()` template is at the bottom of the sketch.
 
