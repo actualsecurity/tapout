@@ -293,7 +293,7 @@ static const uint8_t  RINGLOG_N         = 20;          // events kept on flash
 static const uint8_t  RINGLOG_VERSION   = 2;           // bump if blob layout changes (v2 adds simMask)
 
 // Web identity / build stamp.
-static const char* FW_VERSION    = "2.0.16";
+static const char* FW_VERSION    = "2.0.17";
 static const char* FW_BUILD_MARK = __DATE__ " " __TIME__;
 
 // --------------------------- State --------------------------------------
@@ -1028,12 +1028,19 @@ static void fireCallAlert(bool simulated) {
 
 // Non-blocking retry pump: every CALL_RETRY_MS for the first CALL_MAX_ATTEMPTS
 // tries, then every CALL_SLOW_RETRY_MS; a real call expires CALL_STALE_MS after the ring.
+// Two crew sends must never share one loop pass: on a weak link each can take
+// ~18 s (connect 4 + handshake 10 + read 4), and 18 + 18 exceeds the 30 s task
+// watchdog. That is what reset the board after the 08:58 and 09:33 rings on
+// 2026-10-29 -- the first send ran long, then this retry fired in the same pass
+// because the gap was measured from when the first attempt STARTED. Now the gap
+// runs from when the previous attempt ENDED, and the dog is fed first.
 static void serviceCallQueue() {
   if (!callPending) return;
   uint32_t gap = callAttempts < CALL_MAX_ATTEMPTS ? CALL_RETRY_MS : CALL_SLOW_RETRY_MS;
   if (millis() - lastCallTryMs < gap) return;
-  lastCallTryMs = millis();
-  fireCallAlert(callSimulated);   // retries keep the original real/sim routing
+  esp_task_wdt_reset();                  // fresh 30 s window for this one send
+  fireCallAlert(callSimulated);          // retries keep the original real/sim routing
+  lastCallTryMs = millis();              // measured from the END of the attempt
 }
 
 // ============================ OTA ======================================
@@ -3250,8 +3257,9 @@ static void triggerRingPipeline(bool simulated) {
     callRingEpoch = wall > TIME_VALID_EPOCH ? (uint32_t)(wall - backS) : 0;
   }
   callAttempts   = 0;
-  lastCallTryMs  = now;
+  esp_task_wdt_reset();                  // fresh 30 s window for the first send
   fireCallAlert(simulated);
+  lastCallTryMs  = millis();             // retry gap counts from the END of this attempt
 }
 
 // ---------------------- Hourly heartbeat --------------------------------
