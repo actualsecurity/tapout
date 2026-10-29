@@ -242,8 +242,14 @@ static const uint16_t HTTP_READ_TIMEOUT_MS    = 4000;
 static const uint8_t  TLS_HANDSHAKE_TIMEOUT_S = 10;
 
 // Never-lose-a-call retry of the CALL alert when WiFi/ntfy is down.
-static const uint8_t  CALL_MAX_ATTEMPTS = 12;          // ~1 min of retries
-static const uint32_t CALL_RETRY_MS     = 5000;        // gap between retries
+static const uint8_t  CALL_MAX_ATTEMPTS = 12;          // fast retries (~1 min), then slow ones
+static const uint32_t CALL_RETRY_MS     = 5000;        // gap between the fast retries
+static const uint32_t CALL_SLOW_RETRY_MS = 30000;      // gap after that
+// A REAL call keeps retrying while connected until this long after the ring. v2.0.9
+// gave up after ~1 min, so an internet outage with WiFi still up silently dropped
+// the call (its "delivery failed" notice couldn't get out either). WiFi DOWN never
+// counted toward this: the call waits for the link, as before.
+static const uint32_t CALL_GIVEUP_MS    = 10UL * 60UL * 1000UL;
 
 // Non-blocking red-LED hold after a ring (replaces the old blocking delay).
 static const uint32_t RING_LED_HOLD_MS  = 1500;
@@ -812,9 +818,9 @@ static void serviceCredWarn() {
 }
 
 // ===================== NEVER-LOSE-A-CALL QUEUE =========================
-// Sends the CALL alert; on failure leaves callPending true to retry, and after
-// CALL_MAX_ATTEMPTS surfaces a delivery-failure on the STATUS topic so a ring
-// is never silently lost.
+// Sends the CALL alert; on failure leaves callPending true to retry (fast, then
+// every 30 s) until CALL_GIVEUP_MS after the ring, then surfaces a delivery-failure
+// on the STATUS topic so a ring is never silently lost. WiFi-down time doesn't count.
 static void fireCallAlert(bool simulated) {
   // NEVER burn a retry attempt when there is no link. sendNtfy() would return
   // false immediately without a real POST, so counting it would exhaust all
@@ -918,15 +924,18 @@ static void fireCallAlert(bool simulated) {
     } else {
       Serial.println(F("[sim] simulated ring alert delivered"));
     }
-  } else if (++callAttempts >= CALL_MAX_ATTEMPTS) {
+  } else if (callAttempts < 255 && ++callAttempts >= CALL_MAX_ATTEMPTS
+             && (simulated || millis() - callDetectedMs >= CALL_GIVEUP_MS)) {
     callPending = false;                 // give up; surface on STATUS
     if (!simulated) { boxClearCall(); callRestoredEpoch = 0; }
     Serial.println(F("[ring] CALL alert FAILED after retries"));
     {
-      char m[220];
-      snprintf(m, sizeof(m), "A ring was detected (%s) but the crew alert could not be delivered after %u "
-               "attempts (first error HTTP %d, last HTTP %d). Check WiFi / outbound 443 to ntfy.sh.",
-               ts[0] ? ts : "time unknown", (unsigned)callAttempts, callFirstFailCode, lastNtfyCode);
+      char m[260];
+      snprintf(m, sizeof(m), "A ring was detected (%s) but the crew alert could not be delivered: %u "
+               "attempts over %lu min (first error HTTP %d, last HTTP %d). WiFi was up, so the internet / "
+               "outbound 443 to ntfy.sh was likely down.",
+               ts[0] ? ts : "time unknown", (unsigned)callAttempts,
+               (unsigned long)((millis() - callDetectedMs) / 60000UL), callFirstFailCode, lastNtfyCode);
       sendNtfy(C.ntfyStatus.c_str(), "ALERT DELIVERY FAILED", m, "high", "warning");
     }
     statusError();
@@ -936,10 +945,12 @@ static void fireCallAlert(bool simulated) {
   }
 }
 
-// Non-blocking retry pump; gated on CALL_RETRY_MS so it never spins.
+// Non-blocking retry pump: every CALL_RETRY_MS for the first CALL_MAX_ATTEMPTS
+// tries, then every CALL_SLOW_RETRY_MS until CALL_GIVEUP_MS after the ring.
 static void serviceCallQueue() {
   if (!callPending) return;
-  if (millis() - lastCallTryMs < CALL_RETRY_MS) return;
+  uint32_t gap = callAttempts < CALL_MAX_ATTEMPTS ? CALL_RETRY_MS : CALL_SLOW_RETRY_MS;
+  if (millis() - lastCallTryMs < gap) return;
   lastCallTryMs = millis();
   fireCallAlert(callSimulated);   // retries keep the original real/sim routing
 }
