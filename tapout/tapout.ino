@@ -245,11 +245,13 @@ static const uint8_t  TLS_HANDSHAKE_TIMEOUT_S = 10;
 static const uint8_t  CALL_MAX_ATTEMPTS = 12;          // fast retries (~1 min), then slow ones
 static const uint32_t CALL_RETRY_MS     = 5000;        // gap between the fast retries
 static const uint32_t CALL_SLOW_RETRY_MS = 30000;      // gap after that
-// A REAL call keeps retrying while connected until this long after the ring. v2.0.9
-// gave up after ~1 min, so an internet outage with WiFi still up silently dropped
-// the call (its "delivery failed" notice couldn't get out either). WiFi DOWN never
-// counted toward this: the call waits for the link, as before.
-static const uint32_t CALL_GIVEUP_MS    = 10UL * 60UL * 1000UL;
+// A pre-alert is only useful within ~2 min of the ring: after that the real
+// dispatch page (60 Control) has already gone out, so a late one is just noise.
+// A REAL call is retried (WiFi down or up) until this long after the ring, then
+// dropped and logged on STATUS. (v2.0.9 held it forever while WiFi was down and
+// paged hours late; while WiFi was up it gave up after ~1 min with a notice that
+// usually couldn't get out either.)
+static const uint32_t CALL_STALE_MS     = 2UL * 60UL * 1000UL;
 
 // Non-blocking red-LED hold after a ring (replaces the old blocking delay).
 static const uint32_t RING_LED_HOLD_MS  = 1500;
@@ -345,7 +347,7 @@ static const uint32_t NET_PROBE_MS       = 5UL * 60UL * 1000UL;  // probe if not
 static const uint8_t  NET_HEAL_RECONNECT = 3;                    // failed probes -> reconnect WiFi
 static const uint8_t  NET_HEAL_REBOOT    = 5;                    // failed probes -> reboot
 static const uint32_t WIFI_DOWN_REBOOT_MS = 15UL * 60UL * 1000UL; // x 1/2/4/8 with the heal streak
-static const uint32_t RESTORED_CALL_MAX_S = 10UL * 60UL;         // re-page a saved call only if this fresh
+static const uint32_t RESTORED_CALL_MAX_S = CALL_STALE_MS / 1000;  // same freshness rule after a restart
 
 enum BoxEv : uint8_t {
   EV_BOOT = 1, EV_WIFI_LOST, EV_WIFI_UP, EV_NET_DOWN, EV_NET_UP, EV_SEND_FAIL,
@@ -397,7 +399,10 @@ static esp_core_dump_summary_t crashSum;
 static char      crashReason[64] = "";
 static uint32_t  savedCallEpoch = 0;        // a real call detected before the restart (NVS), 0 = none
 static bool      savedCallChecked = false;
-static bool      savedCallForce = false;    // held through a self-heal restart: page whatever its age
+static bool      savedCallForce = false;    // (legacy NVS flag; no longer pages stale calls)
+static uint32_t  callExpireMs = 0;          // millis() after which the latched REAL call is stale (CALL_STALE_MS)
+static char      expiredNote[320] = "";     // STATUS log for a pre-alert that was dropped as stale
+static uint32_t  lastExpiredNoteTryMs = 0;
 static uint8_t   bootEvHead = 0, bootEvPrior = 0;  // where this boot's events start in the ring
 
 static uint32_t callRestoredEpoch = 0;   // != 0: the latched call was saved before a restart
@@ -818,10 +823,30 @@ static void serviceCredWarn() {
 }
 
 // ===================== NEVER-LOSE-A-CALL QUEUE =========================
-// Sends the CALL alert; on failure leaves callPending true to retry (fast, then
-// every 30 s) until CALL_GIVEUP_MS after the ring, then surfaces a delivery-failure
-// on the STATUS topic so a ring is never silently lost. WiFi-down time doesn't count.
+// Sends the CALL alert; on failure leaves callPending true to retry until
+// CALL_STALE_MS after the ring (a later pre-alert is useless: dispatch has paged),
+// then drops it and logs that on the STATUS topic, so a ring is never silently lost.
 static void fireCallAlert(bool simulated) {
+  // Too late to be useful: the real dispatch page has gone out. Drop it, log it.
+  if (!simulated && (int32_t)(millis() - callExpireMs) >= 0) {
+    char ts[48];
+    if (callRingEpoch) { time_t t = (time_t)callRingEpoch; struct tm lt; localtime_r(&t, &lt);
+                         strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S %Z", &lt); }
+    else snprintf(ts, sizeof(ts), "(time unknown)");
+    snprintf(expiredNote, sizeof(expiredNote),
+      "The pre-alert for the %s ring was NOT sent: it could not be delivered within %lu min (%s), and by "
+      "then the real dispatch page has gone out. %u failed attempt%s (first error HTTP %d, last HTTP %d).",
+      ts, (unsigned long)(CALL_STALE_MS / 60000UL),
+      WiFi.status() == WL_CONNECTED ? "WiFi was up: internet / ntfy.sh unreachable" : "WiFi was down",
+      (unsigned)callAttempts, callAttempts == 1 ? "" : "s", callFirstFailCode, lastNtfyCode);
+    callPending = false;
+    callRestoredEpoch = 0;
+    boxClearCall();
+    lastExpiredNoteTryMs = 0;
+    Serial.println(F("[ring] CALL alert dropped as stale (> CALL_STALE_MS)"));
+    statusError();
+    return;
+  }
   // NEVER burn a retry attempt when there is no link. sendNtfy() would return
   // false immediately without a real POST, so counting it would exhaust all
   // CALL_MAX_ATTEMPTS within ~60 s and SILENTLY drop a real call during any
@@ -924,8 +949,7 @@ static void fireCallAlert(bool simulated) {
     } else {
       Serial.println(F("[sim] simulated ring alert delivered"));
     }
-  } else if (callAttempts < 255 && ++callAttempts >= CALL_MAX_ATTEMPTS
-             && (simulated || millis() - callDetectedMs >= CALL_GIVEUP_MS)) {
+  } else if (callAttempts < 255 && ++callAttempts >= CALL_MAX_ATTEMPTS && simulated) {
     callPending = false;                 // give up; surface on STATUS
     if (!simulated) { boxClearCall(); callRestoredEpoch = 0; }
     Serial.println(F("[ring] CALL alert FAILED after retries"));
@@ -946,7 +970,7 @@ static void fireCallAlert(bool simulated) {
 }
 
 // Non-blocking retry pump: every CALL_RETRY_MS for the first CALL_MAX_ATTEMPTS
-// tries, then every CALL_SLOW_RETRY_MS until CALL_GIVEUP_MS after the ring.
+// tries, then every CALL_SLOW_RETRY_MS; a real call expires CALL_STALE_MS after the ring.
 static void serviceCallQueue() {
   if (!callPending) return;
   uint32_t gap = callAttempts < CALL_MAX_ATTEMPTS ? CALL_RETRY_MS : CALL_SLOW_RETRY_MS;
@@ -2408,19 +2432,27 @@ static void serviceCrashReport() {
   }
 }
 
+// STATUS log for a pre-alert dropped as stale; held until it can be sent.
+static void serviceExpiredNote() {
+  if (!expiredNote[0] || WiFi.status() != WL_CONNECTED) return;
+  if (lastExpiredNoteTryMs && millis() - lastExpiredNoteTryMs < REPORT_RETRY_MS) return;
+  lastExpiredNoteTryMs = millis();
+  if (sendNtfy(C.ntfyStatus.c_str(), "Pre-alert NOT sent (too late)", expiredNote, "high", "warning"))
+    expiredNote[0] = 0;
+}
+
 // Re-send (or report) a real call that was detected before the restart.
 static void serviceSavedCall() {
   static uint32_t lastTryMs = 0;
   if (!savedCallEpoch || savedCallChecked || WiFi.status() != WL_CONNECTED) return;
-  if (!savedCallForce && !timeSynced() && millis() < 120000) return;   // give NTP a chance to judge the age
   if (lastTryMs && millis() - lastTryMs < REPORT_RETRY_MS) return;
   lastTryMs = millis();
   time_t now = time(nullptr);
   bool known = savedCallEpoch > 1 && now > TIME_VALID_EPOCH && (uint32_t)now >= savedCallEpoch;
   uint32_t ageS = known ? (uint32_t)now - savedCallEpoch : 0;
-  // Page it if fresh -- or ALWAYS if the device itself chose the restart that held
-  // it up (self-heal), so healing can never downgrade a real call.
-  if (savedCallForce || (known && ageS <= RESTORED_CALL_MAX_S)) {
+  // Page it only if still fresh: within CALL_STALE_MS of the ring (the clock
+  // survives a software/watchdog restart; after a power cut the age is unknown).
+  if (known && ageS < RESTORED_CALL_MAX_S) {
     savedCallChecked = true;
     callRestoredEpoch = savedCallEpoch;        // STATUS gets the "delivered after a restart" note
     callRingEpoch  = savedCallEpoch > 1 ? savedCallEpoch : 0;
@@ -2429,15 +2461,16 @@ static void serviceSavedCall() {
     callSimulated  = false;
     callAttempts   = 0;
     callDetectedMs = millis();
+    callExpireMs   = millis() + (RESTORED_CALL_MAX_S - ageS) * 1000UL;   // deadline is from the RING
     lastCallTryMs  = millis();
     fireCallAlert(false);
-    return;                                    // key cleared on delivery / give-up
+    return;                                    // key cleared on delivery / expiry
   }
   char when[24]; fmtWhen(known ? savedCallEpoch : 0, 0, when, sizeof(when));
   char msg[220];
-  snprintf(msg, sizeof(msg), "A real call was detected %s but its alert was not delivered before the device "
-           "restarted. %s, so the crew was NOT paged now.", known ? when : "(time unknown)",
-           known ? "It is too old to page" : "Its age is unknown");
+  snprintf(msg, sizeof(msg), "A real call was detected %s but its pre-alert was not delivered before the "
+           "device restarted. %s, so the crew was NOT paged now (dispatch will have paged).",
+           known ? when : "(time unknown)", known ? "It is older than 2 min" : "Its age is unknown");
   if (sendNtfy(C.ntfyStatus.c_str(), "Undelivered call before restart", msg, "high", "warning")) {
     savedCallChecked = true;
     boxClearCallIf(savedCallEpoch);            // only if no newer call replaced it
@@ -2445,16 +2478,11 @@ static void serviceSavedCall() {
 }
 
 // Self-restart for healing; never during OTA trial/download. Any just-confirmed
-// ring is handed to the pipeline (and so saved) first, and a real call that is
-// still latched is flagged "force" so it pages after boot whatever its age.
+// ring is handed to the pipeline (and so saved) first; after boot it is paged only
+// if still within CALL_STALE_MS of the ring, else logged on STATUS.
 static void selfHealReboot(const char* why) {
   if (g_onProbation || otaState != PULL_OTA_IDLE || otaInProgress) return;
-  if (realCallInFlight()) {                    // hands over ringPagesPending -> boxSaveCall
-    Preferences p;
-    p.begin("fhabox", false);
-    p.putBool("pcall_force", true);
-    p.end();
-  }
+  (void)realCallInFlight();                    // hands over ringPagesPending -> boxSaveCall
   healStreak++;
   boxEvent(EV_HEAL_REBOOT, 0);
   noteReboot(why);
@@ -2690,6 +2718,7 @@ void loop() {
   serviceIgnoredActivity();     // STATUS note for non-ring line activity (throttled)
   serviceArmCheck();            // STATUS warning if ring detection never armed
   serviceSavedCall();           // re-send a real call saved before a restart (before STATUS reports)
+  serviceExpiredNote();         // log a pre-alert dropped as stale (> 2 min)
   serviceRestartReport();       // once per boot: why it restarted + what it looked like before
   serviceCrashReport();         // once: summary of a saved crash dump
   serviceBlackBox();            // checkpoints, WiFi events, connectivity probe, self-heal
@@ -2952,6 +2981,7 @@ static void triggerRingPipeline(bool simulated) {
   callSimulated  = simulated;
   callDetectedMs = simulated ? now : ringDetectedAtMs;   // real: when the pattern was confirmed
   callFirstFailCode = 0;
+  callExpireMs   = callDetectedMs + CALL_STALE_MS;
   {
     time_t wall = time(nullptr);
     uint32_t backS = (now - callDetectedMs) / 1000;      // pattern confirmed slightly before this pass

@@ -100,9 +100,18 @@ These all still work in v2.0.0 and run **before** any of the new code each loop:
   - **This is the life-safety path. It is never starved, including during a
     firmware download.**
 - **ntfy.sh HTTPS alert** (Pushover template included, commented out).
-- **Never-lose-a-call retry latch** — a detected ring is latched and retried
-  until delivered; if delivery ultimately fails it surfaces a failure notice on
-  the STATUS topic. Retries are *not* burned while WiFi is down.
+- **Pre-alert retry latch, with a 2-minute deadline.** A detected ring is
+  latched and retried until it is delivered, but only for **2 min after the
+  ring**, whether WiFi is down or up with no internet. A later pre-alert is
+  useless, because the real dispatch page has gone out by then. A call that
+  misses the window is dropped and logged on STATUS as "Pre-alert NOT sent (too
+  late)", sent once the network is back.
+- **The crew channel only ever carries the standard alert:** "Incoming call on
+  the station line at <time the phone rang>". If the first send fails and a
+  retry delivers it, the crew still gets exactly that, and STATUS gets "Crew
+  alert: first send failed" with the first error code and how late it was.
+  v2.0.9 used to change the crew text to "…(alert delayed by network)". A
+  firmware gate refuses every other message to the crew topic.
 - **NTP wall-clock timestamps** on CALL alerts (graceful uptime fallback).
 - **mDNS + LAN status web page** at `http://tapout.local`, with a
   `/status.json` endpoint and auth-gated reboot / send-test / simulate actions.
@@ -502,9 +511,10 @@ the unit just went dark. Now:
 - Each heal is logged and shows up in the next restart report.
 - It never self-heals during an OTA download or trial.
 
-**Calls survive a restart.** A real call that was detected but not yet
-delivered is saved. After a restart it is re-sent to the crew, worded "…alert
-was delayed ~N min because the device restarted", if it is under 10 min old.
+**Calls survive a restart, within the 2-minute window.** A real call that was
+detected but not yet delivered is saved. After a restart it is sent to the crew
+as the standard alert, if it is still under 2 min since the ring. The clock
+survives a software or watchdog restart; after a power cut its age is unknown.
 Otherwise it is reported on STATUS only.
 
 **Knowing while it's down: the dead-man check-in.** A device that's off can't
