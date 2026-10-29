@@ -291,7 +291,7 @@ static const uint8_t  RINGLOG_N         = 20;          // events kept on flash
 static const uint8_t  RINGLOG_VERSION   = 2;           // bump if blob layout changes (v2 adds simMask)
 
 // Web identity / build stamp.
-static const char* FW_VERSION    = "2.0.14";
+static const char* FW_VERSION    = "2.0.15";
 static const char* FW_BUILD_MARK = __DATE__ " " __TIME__;
 
 // --------------------------- State --------------------------------------
@@ -2935,20 +2935,45 @@ void loop() {
   ArduinoOTA.handle();
 
   serviceWifi();                // non-blocking reconnect w/ backoff
-  serviceCallQueue();           // retry an undelivered CALL alert (never lost)
-  handleHeartbeat();            // hourly "still alive" ping
-  serviceStuckLine();           // continuous detector "stuck active" monitor
-  serviceCredWarn();            // one-shot default-password warning
-  serviceHeapCheck();           // low-heap canary (throttled)
-  serviceIgnoredActivity();     // STATUS note for non-ring line activity (throttled)
-  serviceArmCheck();            // STATUS warning if ring detection never armed
-  serviceSavedCall();           // re-send a real call saved before a restart (before STATUS reports)
-  serviceExpiredNote();         // log a pre-alert dropped as stale (> 2 min)
-  serviceStatusLog();           // resend queued STATUS logs once the network is back (not health checks)
-  serviceRestartReport();       // once per boot: why it restarted + what it looked like before
-  serviceCrashReport();         // once: summary of a saved crash dump
-  serviceBlackBox();            // checkpoints, WiFi events, connectivity probe, self-heal
-  serviceDeadman();             // external check-in, withheld when degraded (opt-in)
+  serviceCallQueue();           // retry an undelivered CALL alert (never lost) -- always runs
+
+  // Each of the services below may do ONE blocking TLS send (up to ~18 s when the
+  // network is bad). v2.0.13 ran them back-to-back with the watchdog fed only
+  // at the top of the pass and inside each send: when several came due in the
+  // same pass -- which sustained refusals (ntfy 429) guarantee -- one pass ran
+  // past the 30 s task watchdog and the board reset (boots #53/#54/#55 on
+  // 2026-10-29, each preceded by a 429 streak). Now: feed the watchdog BEFORE
+  // each one, and once a pass has spent LOOP_SEND_BUDGET_MS in these optional
+  // services, stop and let the next pass continue -- the ring sampler and the
+  // crew-alert retry never wait behind a backlog of status chatter.
+  {
+    static const uint32_t LOOP_SEND_BUDGET_MS = 12000;
+    const uint32_t passStart = millis();
+    typedef void (*Svc)();
+    static const Svc optional[] = {
+      handleHeartbeat,            // 6-hourly "still alive" ping (or 10-min on a dedicated topic)
+      serviceStuckLine,           // continuous detector "stuck active" monitor
+      serviceCredWarn,            // one-shot default-password warning
+      serviceHeapCheck,           // low-heap canary (throttled)
+      serviceIgnoredActivity,     // STATUS note for non-ring line activity (throttled)
+      serviceArmCheck,            // STATUS warning if ring detection never armed
+      serviceSavedCall,           // re-send a real call saved before a restart (before STATUS reports)
+      serviceExpiredNote,         // log a pre-alert dropped as stale (> 2 min)
+      serviceStatusLog,           // resend queued STATUS logs once the network is back (not health checks)
+      serviceRestartReport,       // once per boot: why it restarted + what it looked like before
+      serviceCrashReport,         // once: summary of a saved crash dump
+      serviceBlackBox,            // checkpoints, WiFi events, connectivity probe, self-heal
+      serviceDeadman,             // external check-in, withheld when degraded (opt-in)
+    };
+    static uint8_t next = 0;      // round-robin so a budget cut never starves the same tail every pass
+    for (uint8_t n = 0; n < sizeof(optional) / sizeof(optional[0]); n++) {
+      esp_task_wdt_reset();
+      optional[next]();
+      next = (next + 1) % (sizeof(optional) / sizeof(optional[0]));
+      if (millis() - passStart >= LOOP_SEND_BUDGET_MS) break;   // resume from `next` on the next pass
+    }
+  }
+  esp_task_wdt_reset();
   server.handleClient();        // serve status page / json / actions (fast)
 
   // ---- RAIL B: commit or roll back a freshly-flashed image on probation ----
