@@ -426,6 +426,8 @@ static void serviceBlackBox();
 static void serviceRestartReport();
 static void serviceCrashReport();
 static void serviceSavedCall();
+static bool logStatus(const char* title, const char* body, const char* prio, const char* tags);
+static void serviceStatusLog();
 
 // ----- Never-lose-a-call queue -----
 static bool     callPending    = false;
@@ -749,7 +751,7 @@ static void serviceStuckLine() {
 
   if (!low) {                                  // line idle (HIGH) -> healthy
     if (lineStuckWarned && WiFi.status() == WL_CONNECTED) {
-      if (sendNtfy(C.ntfyStatus.c_str(), "Detector line recovered",
+      if (logStatus("Detector line recovered",
                    "D4 returned to idle (HIGH). The ring line is no longer stuck active.",
                    "default", "white_check_mark")) {
         lineStuckWarned = false;
@@ -772,7 +774,7 @@ static void serviceStuckLine() {
     "call. Likely the ELK-930 is miswired/shorted/stuck, or tip/ring isn't connected "
     "so the open-collector output isn't sitting idle-HIGH. Verify the detector. (Bell stays primary.)",
     (unsigned long)(LINE_STUCK_MS / 1000));
-  if (sendNtfy(C.ntfyStatus.c_str(), "Detector line STUCK active", msg, "high", "warning")) {
+  if (logStatus("Detector line STUCK active", msg, "high", "warning")) {
     lineStuckWarned = true;
   }
 }
@@ -795,7 +797,7 @@ static void serviceHeapCheck() {
              "failing; consider a scheduled power-cycle.",
              (unsigned)h, (unsigned)largest);
     boxEvent(EV_LOW_HEAP, (uint16_t)(largest / 1024));
-    sendNtfy(C.ntfyStatus.c_str(), "Low memory", m, "high", "warning");
+    logStatus("Low memory", m, "high", "warning");
     lowHeapWarned = true;
   } else if (h > LOW_HEAP_CLEAR && largest > 24000) {
     lowHeapWarned = false;
@@ -812,7 +814,7 @@ static void serviceCredWarn() {
     return;
   }
   if (WiFi.status() != WL_CONNECTED) return;       // retry once WiFi is up
-  if (sendNtfy(C.ntfyStatus.c_str(), "Default passwords in use",
+  if (logStatus("Default passwords in use",
                "OTA reflash and the admin reboot/send-test/provision actions are "
                "DISABLED: the web_pass and/or ota_pass NVS fields are still the "
                "shipped CHANGE-ME defaults. Re-provision (POST /provision or the "
@@ -943,7 +945,7 @@ static void fireCallAlert(bool simulated) {
         else
           snprintf(note, sizeof(note), "The crew alert for the %s ring went out %lus after the ring "
                    "(WiFi was down or the send was slow). The crew got the standard alert.", ts, (unsigned long)lateS);
-        sendNtfy(C.ntfyStatus.c_str(), callAttempts > 0 ? "Crew alert: first send failed" : "Crew alert delivered late",
+        logStatus(callAttempts > 0 ? "Crew alert: first send failed" : "Crew alert delivered late",
                  note, "default", "hourglass");
       }
     } else {
@@ -960,7 +962,7 @@ static void fireCallAlert(bool simulated) {
                "outbound 443 to ntfy.sh was likely down.",
                ts[0] ? ts : "time unknown", (unsigned)callAttempts,
                (unsigned long)((millis() - callDetectedMs) / 60000UL), callFirstFailCode, lastNtfyCode);
-      sendNtfy(C.ntfyStatus.c_str(), "ALERT DELIVERY FAILED", m, "high", "warning");
+      logStatus("ALERT DELIVERY FAILED", m, "high", "warning");
     }
     statusError();
   } else {
@@ -1775,7 +1777,7 @@ static bool otaDownloadAndFlash(const String& url, size_t totalSize /* firmware 
   if (!verifyImageSignature(imgHash, sigBuf, SIG_TRAILER_SIZE)) {
     Serial.println(F("[ota] signature verification FAILED -- rejecting image"));
     Update.abort();
-    sendNtfy(C.ntfyStatus.c_str(), "OTA REJECTED",
+    logStatus("OTA REJECTED",
              "Bad signature on pulled image -- ignored, running image untouched.",
              "high", "warning");
     otaState = PULL_OTA_IDLE;
@@ -1802,7 +1804,7 @@ static bool otaDownloadAndFlash(const String& url, size_t totalSize /* firmware 
   if (semver(otaPendingVer) <= semver(FW_VERSION)) {
     otaNote("rejected: manifest version not newer than running");
     Update.abort();
-    sendNtfy(C.ntfyStatus.c_str(), "OTA REJECTED",
+    logStatus("OTA REJECTED",
              (String("Manifest ") + otaPendingVer + " not newer than running "
               + FW_VERSION + " -- ignored.").c_str(), "high", "warning");
     otaState = PULL_OTA_IDLE;
@@ -1822,7 +1824,7 @@ static bool otaDownloadAndFlash(const String& url, size_t totalSize /* firmware 
   cfg.putString("ota_pend_ver", otaPendingVer);
   cfg.end();
   otaState = PULL_OTA_PENDING_REBOOT;
-  sendNtfy(C.ntfyStatus.c_str(), "OTA staged",
+  logStatus("OTA staged",
            (String("v") + otaPendingVer + " downloaded + signature verified + written to the "
             "standby slot. Rebooting into a 60s health trial...").c_str(),
            "default", "arrows_counterclockwise");
@@ -1890,7 +1892,7 @@ static void otaCheckManifest() {
   }
   if (minv.length() && semver(FW_VERSION) < semver(minv)) {
     Serial.printf("[ota] manifest requires >= %s, refusing skip from %s\n", minv.c_str(), FW_VERSION);
-    sendNtfy(C.ntfyStatus.c_str(), "OTA skipped",
+    logStatus("OTA skipped",
              (String("Update ") + ver + " needs min_supported " + minv + " > running " + FW_VERSION).c_str(),
              "default", "warning");
     return;
@@ -1900,11 +1902,11 @@ static void otaCheckManifest() {
   otaPendingVer[sizeof(otaPendingVer) - 1] = 0;
   char m[110]; snprintf(m, sizeof(m), "v%s found (running v%s) -- downloading the signed image...", ver.c_str(), FW_VERSION);
   otaNote(m);
-  sendNtfy(C.ntfyStatus.c_str(), "OTA update found", m, "default", "arrow_down");
+  logStatus("OTA update found", m, "default", "arrow_down");
   if (!otaDownloadAndFlash(url, sz)) {     // returns ONLY on failure (success reboots into the new image)
     char f[100]; snprintf(f, sizeof(f), "download/flash of %s FAILED (rejected/timeout/size) -- staying on %s", ver.c_str(), FW_VERSION);
     otaNote(f);
-    sendNtfy(C.ntfyStatus.c_str(), "OTA FAILED", f, "high", "warning");
+    logStatus("OTA FAILED", f, "high", "warning");
   }
 }
 
@@ -1962,7 +1964,7 @@ static void handleCheckOta() {
   // no-update / gate-blocked manual checks -- the JSON response already says so).
   if (wouldUpdate) {
     char p[128]; snprintf(p, sizeof(p), "Manual check: v%s available -> starting update from v%s", mver.c_str(), FW_VERSION);
-    sendNtfy(C.ntfyStatus.c_str(), "OTA check (manual)", p, "default", "mag");
+    logStatus("OTA check (manual)", p, "default", "mag");
   }
 
   String j = String(F("{\"current\":\"")) + FW_VERSION + "\",\"gates\":{";
@@ -2037,7 +2039,7 @@ static void otaServiceProbation() {
       cfg.remove("ota_failed_ver");                 // this version proved healthy -> clear any stale marker
       cfg.end();
       C.otaFailedVer = "";
-      sendNtfy(C.ntfyStatus.c_str(), "Update successful",
+      logStatus("Update successful",
                (String("Successfully updated and trialed firmware v") + FW_VERSION +
                 " -- passed the 60s health trial and committed (no rollback). Now running v"
                 + FW_VERSION + ".").c_str(),
@@ -2059,7 +2061,7 @@ static void otaServiceProbation() {
     cfg.begin("fhacfg", false);
     cfg.putString("ota_failed_ver", FW_VERSION);
     cfg.end();
-    sendNtfy(C.ntfyStatus.c_str(), "OTA rolled back",
+    logStatus("OTA rolled back",
              (String("Firmware v") + FW_VERSION + " FAILED its 60s health trial "
               "(WiFi/ntfy unreachable) -- auto-reverted to the previous good image.").c_str(),
              "high", "warning");
@@ -2432,12 +2434,72 @@ static void serviceCrashReport() {
   }
 }
 
+// ---- STATUS log queue ---------------------------------------------------
+// STATUS is the device's log channel. A LOG message (an event or warning) must
+// not be lost to a WiFi/internet outage: logStatus() sends it now if it can,
+// otherwise queues it and serviceStatusLog() resends it, in order, once the
+// network is back -- stamped with when it was logged. HEALTH CHECKS are never
+// queued (heartbeat, dead-man check-in, connectivity probes, ping replies): a
+// stale "still alive" is meaningless. Crew alerts always go first.
+static const uint8_t  SLOG_N = 10;
+struct StatusLogMsg { uint32_t atMs, epoch; char title[48]; char body[480]; char prio[8]; char tags[32]; };
+static StatusLogMsg slog[SLOG_N];
+static uint8_t  slogHead = 0, slogCount = 0;
+static uint16_t slogDropped = 0;            // overflowed while offline (reported on the next delivered log)
+static uint32_t lastSlogTryMs = 0;
+static bool     lastSlogOk = true;
+
+static bool logStatus(const char* title, const char* body, const char* prio, const char* tags) {
+  // Nothing queued ahead of it and we're online: send now (keeps order).
+  if (slogCount == 0 && WiFi.status() == WL_CONNECTED && !callPending
+      && sendNtfy(C.ntfyStatus.c_str(), title, body, prio, tags)) return true;
+  if (slogCount == SLOG_N) { slogHead = (slogHead + 1) % SLOG_N; slogCount--; slogDropped++; }   // drop oldest
+  StatusLogMsg& e = slog[(slogHead + slogCount) % SLOG_N];
+  time_t now = time(nullptr);
+  e.atMs  = millis();
+  e.epoch = now > TIME_VALID_EPOCH ? (uint32_t)now : 0;
+  strncpy(e.title, title, sizeof(e.title) - 1); e.title[sizeof(e.title) - 1] = 0;
+  strncpy(e.body,  body,  sizeof(e.body)  - 1); e.body[sizeof(e.body) - 1]   = 0;
+  strncpy(e.prio,  prio,  sizeof(e.prio)  - 1); e.prio[sizeof(e.prio) - 1]   = 0;
+  strncpy(e.tags,  tags,  sizeof(e.tags)  - 1); e.tags[sizeof(e.tags) - 1]   = 0;
+  slogCount++;
+  Serial.printf("[log] queued for STATUS (%u waiting): %s\n", (unsigned)slogCount, title);
+  return true;                              // accepted: it WILL be delivered (or counted as dropped)
+}
+
+static void serviceStatusLog() {
+  if (!slogCount || WiFi.status() != WL_CONNECTED || callPending) return;
+  uint32_t gap = lastSlogOk ? 3000 : 30000;   // drain steadily; back off while sends fail
+  if (lastSlogTryMs && millis() - lastSlogTryMs < gap) return;
+  lastSlogTryMs = millis();
+  const StatusLogMsg& e = slog[slogHead];
+  static char body[640];
+  const size_t cap = sizeof(body);
+  int n = 0;
+  if (slogDropped) n = appendf(body, cap, n, "(%u older log message%s dropped while offline.) ",
+                               (unsigned)slogDropped, slogDropped == 1 ? " was" : "s were");
+  n = appendf(body, cap, n, "%s", e.body);
+  uint32_t lateS = (millis() - e.atMs) / 1000;
+  if (lateS >= 30) {
+    char when[24];
+    if (e.epoch) { time_t t = (time_t)e.epoch; struct tm lt; localtime_r(&t, &lt); strftime(when, sizeof(when), "%H:%M:%S", &lt); }
+    else snprintf(when, sizeof(when), "uptime %lus", (unsigned long)(e.atMs / 1000));
+    n = appendf(body, cap, n, " [logged %s, sent %s late]", when, fmtDuration(lateS * 1000UL).c_str());
+  }
+  lastSlogOk = sendNtfy(C.ntfyStatus.c_str(), e.title, body, e.prio, e.tags);
+  if (lastSlogOk) {
+    slogHead = (slogHead + 1) % SLOG_N;
+    slogCount--;
+    slogDropped = 0;
+  }
+}
+
 // STATUS log for a pre-alert dropped as stale; held until it can be sent.
 static void serviceExpiredNote() {
   if (!expiredNote[0] || WiFi.status() != WL_CONNECTED) return;
   if (lastExpiredNoteTryMs && millis() - lastExpiredNoteTryMs < REPORT_RETRY_MS) return;
   lastExpiredNoteTryMs = millis();
-  if (sendNtfy(C.ntfyStatus.c_str(), "Pre-alert NOT sent (too late)", expiredNote, "high", "warning"))
+  if (logStatus("Pre-alert NOT sent (too late)", expiredNote, "high", "warning"))
     expiredNote[0] = 0;
 }
 
@@ -2471,7 +2533,7 @@ static void serviceSavedCall() {
   snprintf(msg, sizeof(msg), "A real call was detected %s but its pre-alert was not delivered before the "
            "device restarted. %s, so the crew was NOT paged now (dispatch will have paged).",
            known ? when : "(time unknown)", known ? "It is older than 2 min" : "Its age is unknown");
-  if (sendNtfy(C.ntfyStatus.c_str(), "Undelivered call before restart", msg, "high", "warning")) {
+  if (logStatus("Undelivered call before restart", msg, "high", "warning")) {
     savedCallChecked = true;
     boxClearCallIf(savedCallEpoch);            // only if no newer call replaced it
   }
@@ -2719,6 +2781,7 @@ void loop() {
   serviceArmCheck();            // STATUS warning if ring detection never armed
   serviceSavedCall();           // re-send a real call saved before a restart (before STATUS reports)
   serviceExpiredNote();         // log a pre-alert dropped as stale (> 2 min)
+  serviceStatusLog();           // resend queued STATUS logs once the network is back (not health checks)
   serviceRestartReport();       // once per boot: why it restarted + what it looked like before
   serviceCrashReport();         // once: summary of a saved crash dump
   serviceBlackBox();            // checkpoints, WiFi events, connectivity probe, self-heal
@@ -2922,7 +2985,7 @@ static void serviceIgnoredActivity() {
     "Ignored since boot: %lu.",
     (unsigned long)agoS, (unsigned long)bursts, bursts == 1 ? "" : "s",
     (unsigned long)(lenMs / 1000), (unsigned long)((lenMs % 1000) / 100), (unsigned long)count);
-  sendNtfy(C.ntfyStatus.c_str(), "Line activity ignored (not a ring)", msg, "default", "shield");
+  logStatus("Line activity ignored (not a ring)", msg, "default", "shield");
 }
 
 // Loud STATUS warning if detection hasn't armed a minute after boot (the line
@@ -2931,7 +2994,7 @@ static void serviceIgnoredActivity() {
 static void serviceArmCheck() {
   static bool samplerWarned = false;
   if (!ringTimerOk && !samplerWarned && WiFi.status() == WL_CONNECTED) {
-    samplerWarned = sendNtfy(C.ntfyStatus.c_str(), "Ring sampler degraded",
+    samplerWarned = logStatus("Ring sampler degraded",
       "The 5 ms ring-sampling timer failed to start, so D4 is sampled from the main loop. "
       "Network sends can now hide or split rings. Reboot the device; report it if this repeats.",
       "high", "warning");
@@ -2942,7 +3005,7 @@ static void serviceArmCheck() {
   if (warned || millis() < 60000 || WiFi.status() != WL_CONNECTED) return;
   if (lastTryMs && millis() - lastTryMs < 30UL * 60UL * 1000UL) return;
   lastTryMs = millis();
-  if (sendNtfy(C.ntfyStatus.c_str(), "Ring detector NOT armed",
+  if (logStatus("Ring detector NOT armed",
         "The detector line has not read idle for 3 s straight since boot, so ring detection "
         "is not armed and a call would NOT page. Check the ELK-930 and the phone cord. "
         "(The bell is unaffected.)", "high", "warning")) {
@@ -3009,6 +3072,7 @@ static void handleHeartbeat() {
            (unsigned long)heartbeatSeq, ts, (unsigned long)ringCount, (unsigned long)ignoredActivity,
            (unsigned)ESP.getFreeHeap(), (unsigned)largest, (unsigned)esp_get_minimum_free_heap_size(),
            (int)WiFi.RSSI(), (unsigned)wifiDrops);
+  // Health check, not a log: sent live or not at all (never queued/resent late).
   sendNtfy(C.ntfyStatus.c_str(), "Tapout heartbeat",
            msg, "min", "green_heart");
 }
