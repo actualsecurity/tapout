@@ -115,10 +115,13 @@ static const char* DEF_WIFI_SSID    = "CHANGE-ME";
 static const char* DEF_WIFI_PASS    = "";
 static const char* DEF_NTFY_CALL    = "https://ntfy.sh/CHANGE-ME";
 static const char* DEF_NTFY_STATUS  = "https://ntfy.sh/CHANGE-ME";
-// Dedicated 1-min heartbeat topic. Compiled in for now (readable in the public
-// repo -- it carries only uptime/signal/heap, no alerts, no secrets); an NVS
-// ntfy_hb value overrides it. TODO: move to NVS-only once provisioned on site.
-static const char* DEF_NTFY_HB      = "https://ntfy.sh/pcfd-hb-c7a9bf6f24c6dc80ac45";
+// Dedicated heartbeat topic -- OFF. The 1-minute beat shipped in v2.0.12/13
+// burned through ntfy.sh's FREE-TIER QUOTA (250 publishes per day per IP) by
+// 04:32 on its first night; from then until the daily reset every post from the
+// station -- including a real crew page at 07:13 -- was refused with HTTP 429.
+// A dedicated beat only makes sense on a paid/self-hosted ntfy; an NVS ntfy_hb
+// value still enables it (period HB_FAST_MS) for that case.
+static const char* DEF_NTFY_HB      = "";
 static const char* DEF_OTA_PASS     = "CHANGE-ME";   // ArduinoOTA (attended LAN reflash) password
 static const char* DEF_WEB_USER     = "crew";
 static const char* DEF_WEB_PASS     = "CHANGE-ME";   // web admin (reboot/send-test/provision) password
@@ -234,7 +237,7 @@ static const uint32_t RING_REARM_IDLE_MS  = 8000;
 // Heartbeat: every HB_FAST_MS on the dedicated heartbeat topic when one is
 // provisioned (mute that topic; it exists so a silent death is noticed in minutes,
 // not hours), else every HB_SLOW_MS on STATUS so STATUS stays events-only.
-static const uint32_t HB_FAST_MS          = 60UL * 1000UL;          // 1 min
+static const uint32_t HB_FAST_MS          = 10UL * 60UL * 1000UL;   // 10 min (144/day) -- paid/self-hosted ntfy only
 static const uint32_t HB_SLOW_MS          = 6UL * 60UL * 60UL * 1000UL;  // 6 h
 static inline bool hbDedicated() { return C.ntfyHb.startsWith("https://") && !looksLikePlaceholder(C.ntfyHb.c_str()); }
 static inline uint32_t heartbeatPeriodMs() { return hbDedicated() ? HB_FAST_MS : HB_SLOW_MS; }
@@ -288,7 +291,7 @@ static const uint8_t  RINGLOG_N         = 20;          // events kept on flash
 static const uint8_t  RINGLOG_VERSION   = 2;           // bump if blob layout changes (v2 adds simMask)
 
 // Web identity / build stamp.
-static const char* FW_VERSION    = "2.0.13";
+static const char* FW_VERSION    = "2.0.14";
 static const char* FW_BUILD_MARK = __DATE__ " " __TIME__;
 
 // --------------------------- State --------------------------------------
@@ -420,6 +423,24 @@ static uint8_t   bootEvHead = 0, bootEvPrior = 0;  // where this boot's events s
 static uint32_t callRestoredEpoch = 0;   // != 0: the latched call was saved before a restart
 static uint32_t callRingEpoch = 0;       // wall-clock time the phone rang (0 = unknown / clock unsynced)
 static int      lastNtfyCode = 0;        // last sendNtfy() result (HTTP code, or <0 transport error)
+// ntfy refusing to accept publishes (429 = rate limit / daily quota). Tracked so
+// the device reports UNHEALTHY instead of "WiFi up, all fine", and so it can say
+// exactly how long it was muted once the quota resets. (2026-10-29: muted from
+// 04:32 to the daily reset with healthy:true the whole time.)
+static uint32_t ntfyRefusedSinceMs = 0;  // 0 = not refused
+static uint16_t ntfyRefusedCount   = 0;
+static uint32_t ntfyRefusedCallEpoch = 0;   // a REAL crew page refused during the mute (0 = none)
+static uint32_t ntfyLastProbeMs = 0;
+static const uint32_t QUOTA_PROBE_MS = 15UL * 60UL * 1000UL;
+// While ntfy is refusing publishes, every non-crew send must STOP: ntfy's limiter
+// is a slowly refilling token bucket, and the v2.0.13 device spent each refilled
+// token on heartbeats and held reports instead of the next crew page (two real
+// rings went unpaged on 2026-10-29). One probe send per 15 min detects recovery.
+static bool quotaHold() {
+  if (!ntfyRefusedSinceMs) return false;
+  if (millis() - ntfyLastProbeMs >= QUOTA_PROBE_MS) { ntfyLastProbeMs = millis(); return false; }  // this one may try
+  return true;
+}
 static int      callLastFailCode = 0;    // last error of THIS call's crew sends (not polluted by STATUS sends)
 // Crew-channel gate: sendNtfy() refuses the CALL topic unless this is set, and
 // only fireCallAlert() sets it (around its one send). Nothing else -- status,
@@ -549,6 +570,8 @@ static void serviceCredWarn();
 static void serviceHeapCheck();
 static void serviceIgnoredActivity();
 static void serviceArmCheck();
+static void handleBlackBoxJson();
+static const char* evName(uint8_t c);
 static void startRingSampler();
 static void applyRingConfig();
 static bool realCallInFlight();
@@ -1284,7 +1307,8 @@ static void handleStatusJson() {
 
   // Single machine-checkable verdict + fault list. An external monitor can alarm
   // on healthy==false OR on this page going unreachable.
-  bool healthy = wifiUp && timeSynced() && !frag && !lowHeapWarned && !detectorStuck && ringDet.armed;
+  bool healthy = wifiUp && timeSynced() && !frag && !lowHeapWarned && !detectorStuck && ringDet.armed
+              && !ntfyRefusedSinceMs;
   server.sendContent(String(F(",\"healthy\":")) + (healthy ? "true" : "false"));
   server.sendContent(F(",\"faults\":["));
   {
@@ -1301,6 +1325,7 @@ static void handleStatusJson() {
     if (detectorStuck)  fault("detector_stuck");
     if (g_onProbation)  fault("ota_probation");
     if (!ringDet.armed) fault("detector_unarmed");
+    if (ntfyRefusedSinceMs) fault("ntfy_refusing_429");
   }
   server.sendContent(F("]"));
 
@@ -1366,6 +1391,9 @@ static void handleStatusJson() {
   server.sendContent(String(F(",\"net_fail_probes\":")) + String((unsigned)netFailProbes));
   server.sendContent(String(F(",\"heal_streak\":")) + String((unsigned long)healStreak));
   server.sendContent(String(F(",\"crash_dump_pending\":")) + (crashPending ? "true" : "false"));
+  server.sendContent(String(F(",\"last_ntfy_code\":")) + String(lastNtfyCode));
+  server.sendContent(String(F(",\"ntfy_refused_for_ms\":")) + String(ntfyRefusedSinceMs ? (now - ntfyRefusedSinceMs) : 0));
+  server.sendContent(String(F(",\"ntfy_refused_count\":")) + String((unsigned)ntfyRefusedCount));
 
   // ring_log streamed per-event (no large String). MUST be the last field.
   server.sendContent(F(",\"ring_log\":{\"count\":"));
@@ -2337,6 +2365,57 @@ static void boxBoot() {
   WiFi.onEvent(onWifiEvent);
 }
 
+// GET /blackbox.json -- what the previous boot left behind (checkpoint + events),
+// this boot's events, and the saved crash summary if any. Exists because the
+// ntfy copy of this can be refused (quota) exactly when it matters.
+static void handleBlackBoxJson() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  server.sendContent(String(F("{\"boot_count\":")) + String((unsigned long)bootCount));
+  server.sendContent(String(F(",\"reset_reason\":\"")) + gResetReason + "\"");
+  server.sendContent(String(F(",\"restart_why\":\"")) + rebootWhy + "\"");
+  server.sendContent(String(F(",\"restart_reported\":")) + (restartReported ? "true" : "false"));
+  server.sendContent(String(F(",\"prev_valid\":")) + (boxPrevValid ? "true" : "false"));
+  server.sendContent(String(F(",\"prev_from_rtc\":")) + (boxPrevFromRtc ? "true" : "false"));
+  if (boxPrevValid) {
+    const BoxCp& c = boxPrev.cp;
+    server.sendContent(String(F(",\"prev\":{\"epoch\":")) + String((unsigned long)c.epoch)
+      + F(",\"up_s\":") + String((unsigned long)c.upS) + F(",\"boot\":") + String((unsigned long)c.bootCount)
+      + F(",\"free_heap\":") + String((unsigned long)c.freeHeap) + F(",\"largest\":") + String((unsigned long)c.largest)
+      + F(",\"min_free\":") + String((unsigned long)c.minFree) + F(",\"since_ok_s\":") + String((unsigned long)c.sinceOkS)
+      + F(",\"rings\":") + String((unsigned long)c.ringCount) + F(",\"wifi_drops\":") + String((unsigned)c.wifiDrops)
+      + F(",\"last_disc\":") + String((unsigned)c.lastDisc) + F(",\"rssi\":") + String((int)c.rssi)
+      + F(",\"wifi_up\":") + (c.wifiUp ? "true" : "false") + F(",\"fail_streak\":") + String((unsigned)c.failStreak) + F("}"));
+  }
+  server.sendContent(F(",\"events\":["));
+  for (uint8_t i = 0; i < box.count; i++) {
+    const BoxEvt& e = box.ev[(box.head + BOX_EVENTS - box.count + i) % BOX_EVENTS];
+    if (i) server.sendContent(F(","));
+    server.sendContent(String(F("{\"epoch\":")) + String((unsigned long)e.epoch) + F(",\"up_s\":") + String((unsigned long)e.upS)
+      + F(",\"ev\":\"") + evName(e.code) + F("\",\"arg\":") + String((unsigned)e.arg)
+      + F(",\"this_boot\":") + (i >= bootEvPrior ? "true" : "false") + F("}"));
+  }
+  server.sendContent(F("]"));
+  server.sendContent(String(F(",\"crash_dump_pending\":")) + (crashPending ? "true" : "false"));
+  if (crashPending) {
+    server.sendContent(String(F(",\"crash\":{\"reason\":\"")) + crashReason + F("\",\"task\":\"") + crashSum.exc_task
+      + F("\",\"pc\":\"0x") + String((unsigned long)crashSum.exc_pc, HEX) + F("\",\"cause\":") + String((unsigned long)crashSum.ex_info.exc_cause)
+      + F(",\"vaddr\":\"0x") + String((unsigned long)crashSum.ex_info.exc_vaddr, HEX)
+      + F("\",\"elf_sha\":\"") + (const char*)crashSum.app_elf_sha256 + F("\",\"corrupted\":") + (crashSum.exc_bt_info.corrupted ? "true" : "false")
+      + F(",\"bt\":["));
+    for (uint32_t i = 0; i < crashSum.exc_bt_info.depth && i < 16; i++) {
+      if (i) server.sendContent(F(","));
+      server.sendContent(String(F("\"0x")) + String((unsigned long)crashSum.exc_bt_info.bt[i], HEX) + F("\""));
+    }
+    server.sendContent(F("]}"));
+  }
+  server.sendContent(String(F(",\"ntfy_refused_for_ms\":")) + String(ntfyRefusedSinceMs ? (millis() - ntfyRefusedSinceMs) : 0));
+  server.sendContent(F("}"));
+  server.sendContent("");
+  esp_task_wdt_reset();
+}
+
 static const char* evName(uint8_t c) {
   switch (c) {
     case EV_BOOT:           return "boot";
@@ -2543,6 +2622,7 @@ static bool logStatus(const char* title, const char* body, const char* prio, con
 
 static void serviceStatusLog() {
   if (!slogCount || WiFi.status() != WL_CONNECTED || callPending) return;
+  if (ntfyRefusedSinceMs) return;             // quota hold: don't burn refilled tokens on logs
   uint32_t gap = lastSlogOk ? 3000 : 30000;   // drain steadily; back off while sends fail
   if (lastSlogTryMs && millis() - lastSlogTryMs < gap) return;
   lastSlogTryMs = millis();
@@ -2819,6 +2899,7 @@ void setup() {
     }
   });
   server.on("/check-ota",   HTTP_POST, handleCheckOta);   // manual OTA trigger + gate diagnosis
+  server.on("/blackbox.json", HTTP_GET, handleBlackBoxJson); // recorder + crash summary (no ntfy needed)
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.println(F("[web] status server on :80"));
@@ -3176,6 +3257,10 @@ static void handleHeartbeat() {
 // ---------------------- ntfy notification -------------------------------
 static bool sendNtfy(const char* url, const char* title, const char* message,
                      const char* priority, const char* tags) {
+  if (!crewSendOpen && quotaHold()) {
+    lastNtfyCode = 429;                    // treated as refused without spending a request
+    return false;
+  }
   if (!crewSendOpen && C.ntfyCall.length() && strcasecmp(url, C.ntfyCall.c_str()) == 0) {
     Serial.printf("[ntfy] REFUSED a non-alert message to the crew CALL topic: %s\n", title);
     return false;                        // crew channel = the standard ring alert only (see crewSendOpen)
@@ -3222,9 +3307,26 @@ static bool sendNtfy(const char* url, const char* title, const char* message,
   if (code > 0 && code < 300) {
     Serial.printf("[ntfy] sent OK (HTTP %d)\n", code);
     netOk();
+    if (ntfyRefusedSinceMs) {                // publishing is back: say what was missed
+      uint32_t mutedS = (millis() - ntfyRefusedSinceMs) / 1000;
+      char m[300];
+      snprintf(m, sizeof(m), "ntfy.sh refused %u publish%s with HTTP 429 (rate limit / daily quota) over the "
+               "last %s. Everything sent in that window was lost%s. Free-tier cap is 250 messages/day per IP.",
+               (unsigned)ntfyRefusedCount, ntfyRefusedCount == 1 ? "" : "es", fmtDuration(mutedS * 1000UL).c_str(),
+               ntfyRefusedCallEpoch ? " -- INCLUDING A REAL CREW PAGE" : "");
+      ntfyRefusedSinceMs = 0; ntfyRefusedCount = 0;
+      bool hadCall = ntfyRefusedCallEpoch != 0; ntfyRefusedCallEpoch = 0;
+      logStatus(hadCall ? "ntfy quota exceeded -- CREW PAGE LOST" : "ntfy quota exceeded (now recovered)",
+                m, "high", "warning");
+    }
     return true;
   }
   Serial.printf("[ntfy] send failed (HTTP %d)\n", code);
+  if (code == 429) {
+    if (!ntfyRefusedSinceMs) ntfyRefusedSinceMs = millis() ? millis() : 1;
+    if (ntfyRefusedCount < 65535) ntfyRefusedCount++;
+    if (crewSendOpen && callRingEpoch) ntfyRefusedCallEpoch = callRingEpoch;   // a real page was refused
+  }
   netFail(code);
   return false;
 }
@@ -3266,7 +3368,8 @@ static void serviceDeadman() {
   bool healthy = (WiFi.status() == WL_CONNECTED)
               && (digitalRead(RING_PIN) == HIGH)     // detector not stuck active
               && (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= TLS_MIN_CONTIG_BLOCK)
-              && ringDet.armed;                      // unarmed => a call would not page
+              && ringDet.armed                       // unarmed => a call would not page
+              && !ntfyRefusedSinceMs;                // ntfy refusing => a call would not page either
   if (!healthy) return;   // withhold the check-in -> external monitor pages on silence
 
   bool ok = httpGetBounded(C.deadman.c_str());
