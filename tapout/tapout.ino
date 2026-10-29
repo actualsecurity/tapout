@@ -115,7 +115,10 @@ static const char* DEF_WIFI_SSID    = "CHANGE-ME";
 static const char* DEF_WIFI_PASS    = "";
 static const char* DEF_NTFY_CALL    = "https://ntfy.sh/CHANGE-ME";
 static const char* DEF_NTFY_STATUS  = "https://ntfy.sh/CHANGE-ME";
-static const char* DEF_NTFY_HB      = "";   // dedicated 1-min heartbeat topic ("" = heartbeat stays on STATUS, 6-hourly)
+// Dedicated 1-min heartbeat topic. Compiled in for now (readable in the public
+// repo -- it carries only uptime/signal/heap, no alerts, no secrets); an NVS
+// ntfy_hb value overrides it. TODO: move to NVS-only once provisioned on site.
+static const char* DEF_NTFY_HB      = "https://ntfy.sh/pcfd-hb-c7a9bf6f24c6dc80ac45";
 static const char* DEF_OTA_PASS     = "CHANGE-ME";   // ArduinoOTA (attended LAN reflash) password
 static const char* DEF_WEB_USER     = "crew";
 static const char* DEF_WEB_PASS     = "CHANGE-ME";   // web admin (reboot/send-test/provision) password
@@ -285,7 +288,7 @@ static const uint8_t  RINGLOG_N         = 20;          // events kept on flash
 static const uint8_t  RINGLOG_VERSION   = 2;           // bump if blob layout changes (v2 adds simMask)
 
 // Web identity / build stamp.
-static const char* FW_VERSION    = "2.0.11";
+static const char* FW_VERSION    = "2.0.12";
 static const char* FW_BUILD_MARK = __DATE__ " " __TIME__;
 
 // --------------------------- State --------------------------------------
@@ -2026,11 +2029,33 @@ static void handleCheckOta() {
 static void otaCheckProbationOnBoot() {
   const esp_partition_t* run = esp_ota_get_running_partition();
   esp_ota_img_states_t st;
-  if (run && esp_ota_get_state_partition(run, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY) {
+  bool stOk = run && esp_ota_get_state_partition(run, &st) == ESP_OK;
+  // Arduino's Update.end() activates the slot with esp_ota_set_boot_partition(),
+  // NOT esp_ota_end(), so the bootloader never marks a pulled image PENDING_VERIFY:
+  // it boots UNDEFINED. Checking only for PENDING_VERIFY (v2.0.0-v2.0.11) meant the
+  // 60 s trial + auto-rollback NEVER ran -- every pulled image was committed VALID
+  // at boot unexamined. The reboot into a freshly staged image is flagged in NVS
+  // (ota_pending, written right before that reboot), so treat UNDEFINED + that
+  // flag as probation too. The slot is still uncommitted, so rollback works.
+  bool pendingFlag = false;
+  {
+    Preferences pp;
+    pp.begin("fhacfg", true);
+    pendingFlag = pp.getBool("ota_pending", false);
+    pp.end();
+  }
+  if (stOk && (st == ESP_OTA_IMG_PENDING_VERIFY || (st == ESP_OTA_IMG_UNDEFINED && pendingFlag))) {
     g_onProbation   = true;
     trialDeadlineMs = millis() + 60000;     // 60 s to prove health
-    Serial.println(F("[ota] booted PENDING_VERIFY -- on 60s health probation"));
+    Serial.printf("[ota] booted %s after a pull-OTA -- on 60s health probation\n",
+                  st == ESP_OTA_IMG_PENDING_VERIFY ? "PENDING_VERIFY" : "UNDEFINED+ota_pending");
     return;
+  }
+  if (pendingFlag) {                        // stale flag (e.g. an older firmware's reboot): clear it
+    Preferences pp;
+    pp.begin("fhacfg", false);
+    pp.putBool("ota_pending", false);
+    pp.end();
   }
   // NOT on probation: commit the running image as a VALID rollback anchor. This is
   // idempotent (a no-op once already VALID) and is what BOOTSTRAPS RAIL B -- a
@@ -2109,7 +2134,19 @@ static void otaServiceProbation() {
       noteReboot(why);
     }
     delay(200);
-    esp_ota_mark_app_invalid_rollback_and_reboot();   // REVERT to previous good slot (no return)
+    esp_err_t rb = esp_ota_mark_app_invalid_rollback_and_reboot();   // REVERT to previous good slot (no return on success)
+    // Only reached if the rollback was refused (no other bootable app). Don't leave
+    // a "failed" image half-committed and silent: keep running it as VALID (better a
+    // reachable image than a wedged one), clear the pending flag, and say so.
+    esp_ota_mark_app_valid_cancel_rollback();
+    g_onProbation = false;
+    cfg.begin("fhacfg", false);
+    cfg.putBool("ota_pending", false);
+    cfg.end();
+    char m[160];
+    snprintf(m, sizeof(m), "Rollback from v%s was refused (esp_err 0x%x: no other bootable app); kept running "
+             "this image and committed it. Reflash over serial if it stays unhealthy.", FW_VERSION, (unsigned)rb);
+    logStatus("OTA rollback FAILED", m, "high", "warning");
   }
 }
 
