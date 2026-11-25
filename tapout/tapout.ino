@@ -293,7 +293,7 @@ static const uint8_t  RINGLOG_N         = 20;          // events kept on flash
 static const uint8_t  RINGLOG_VERSION   = 2;           // bump if blob layout changes (v2 adds simMask)
 
 // Web identity / build stamp.
-static const char* FW_VERSION    = "2.0.17";
+static const char* FW_VERSION    = "2.0.18";
 static const char* FW_BUILD_MARK = __DATE__ " " __TIME__;
 
 // --------------------------- State --------------------------------------
@@ -1243,6 +1243,7 @@ static void handleRoot() {
   server.sendContent(F("<div class='card'><b>Actions</b> "
          "<span class='sub'>(require login)</span><br><br>"
          "<form method='POST' action='/send-test' style='display:inline'>"
+         "<input name='msg' maxlength='400' placeholder='optional text (STATUS only)'> "
          "<button>Send test alert</button></form> &nbsp; "
          "<form method='POST' action='/simulate-ring' style='display:inline' "
          "onsubmit=\"var p=prompt('Page the REAL crew (CALL topic, MAX priority, "
@@ -1431,10 +1432,35 @@ static void handleStatusJson() {
 }
 
 // POST /send-test (auth). Sends to STATUS topic so it never pages the crew.
+// Optional msg=<text> (form or query) replaces the fixed body: STATUS topic only,
+// never the crew (sendNtfy refuses CALL anyway). It goes in the POST body, never a
+// header; the title stays fixed. Control chars except newline are dropped, and it
+// is capped at TEST_MSG_MAX bytes.
+static const size_t TEST_MSG_MAX = 400;
 static void handleSendTest() {
   if (!requireAuth()) return;
-  bool ok = sendNtfy(C.ntfyStatus.c_str(), "Tapout TEST",
-                     "Manual test alert from the status page.",
+  String body = "Manual test alert from the status page.";
+  if (server.hasArg("msg")) {
+    const String& in = server.arg("msg");
+    String clean;
+    clean.reserve(in.length() < TEST_MSG_MAX ? in.length() : TEST_MSG_MAX);
+    for (size_t i = 0; i < in.length() && clean.length() < TEST_MSG_MAX; i++) {
+      unsigned char c = (unsigned char)in[i];
+      if (c == '\n' || c >= 0x20) clean += (char)c;   // keeps UTF-8 bytes (>= 0x80)
+    }
+    // The cap may split a multi-byte character; ntfy treats a non-UTF-8 body as a
+    // file attachment, so drop any incomplete sequence left at the end.
+    int n = clean.length(), lead = n - 1;
+    while (lead >= 0 && ((unsigned char)clean[lead] & 0xC0) == 0x80) lead--;
+    if (lead >= 0) {
+      unsigned char b = (unsigned char)clean[lead];
+      int need = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1;
+      if (n - lead < need) clean.remove(lead);
+    }
+    clean.trim();
+    if (clean.length()) body = clean;
+  }
+  bool ok = sendNtfy(C.ntfyStatus.c_str(), "Tapout TEST", body.c_str(),
                      "default", "test_tube");
   esp_task_wdt_reset();
   server.send(ok ? 200 : 502, "text/plain",
