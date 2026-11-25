@@ -422,6 +422,9 @@ once WiFi is up and inbound TCP 80 is permitted.
 - **`GET /status.json`** — machine-readable, `Cache-Control: no-store`, streamed in
   chunks. Includes the v1.2.x telemetry plus the v2.0.0 OTA fields listed above.
 - **`POST /send-test`** — test alert to the **STATUS** topic (never pages crew). Auth.
+  Optional `msg=` sets your own text (up to 400 bytes; title stays "Tapout TEST"):
+  `curl -u crew:<pass> --data-urlencode "msg=your text" http://<device>/send-test`.
+  The status page has a text box for the same thing.
 - **`POST /simulate-ring`** — injects a simulated ring through the real pipeline to
   STATUS, `[SIM]`-tagged; 409 if a real CALL is in flight; never increments
   `real_calls_delivered`. A deliberate commissioning page to the CALL topic is
